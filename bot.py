@@ -21,10 +21,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Activo")
+        self.wfile.write(b"Bot Masivo 15-Batch Activo")
 
 def run_web_server():
-    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
+    print(f"[*] Servidor web escuchando en puerto {port}...", flush=True)
     server.serve_forever()
 
 class TLSAdapter(HTTPAdapter):
@@ -36,13 +38,14 @@ class TLSAdapter(HTTPAdapter):
         kwargs['ssl_context'] = context
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
-def enviar_telegram(mensaje):
+def enviar_telegram(mensaje, silencioso=False):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID, 
         "text": mensaje, 
         "parse_mode": "Markdown", 
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
+        "disable_notification": silencioso # Para que el latido no haga sonar el celular
     }
     try:
         requests.post(url, json=payload)
@@ -66,7 +69,7 @@ def obtener_top_postulantes(session, id_oferta):
     return "_Sin datos_"
 
 def monitorear():
-    print("[*] Monitoreo iniciado (Bloques de 15)...", flush=True)
+    print("[*] Monitoreo iniciado con latido de vida...", flush=True)
     ofertas_avisadas = set()
     
     while True:
@@ -80,7 +83,7 @@ def monitorear():
             payload = {'option': 'credential', 'target': 'https://menu.abc.gob.ar/', 'Ecom_User_ID': CUIL, 'Ecom_Password': PASSWORD}
             session.post(login_url, data=payload, verify=False)
             
-            # Consulta (Cambiado a 'Designada' para tus pruebas actuales)
+            # Consulta
             url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
             params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND estado:"Designada"', "rows": "1000", "wt": "json"}
             r = session.get(url_solr, params=params, verify=False)
@@ -89,15 +92,15 @@ def monitorear():
                 docs = r.json().get("response", {}).get("docs", [])
                 hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
                 
-                print(f"[*] Encontrados: {len(hallazgos)} cargos.", flush=True)
-
                 bloque_mensaje = ""
                 contador = 0
                 ts = int(time.time() * 1000)
+                hubo_novedades = False # Empezamos asumiendo que no hay nada nuevo
 
                 for info in hallazgos:
                     id_o = info.get('idoferta')
                     if id_o not in ofertas_avisadas:
+                        hubo_novedades = True # ¡Encontramos algo nuevo!
                         ranking = obtener_top_postulantes(session, id_o)
                         link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                         
@@ -110,16 +113,21 @@ def monitorear():
                         ofertas_avisadas.add(id_o)
                         contador += 1
 
-                        # ENVIAR CADA 15 OFERTAS
                         if contador >= 15:
                             enviar_telegram(f"🚨 **INFORME DE CARGOS (15)** 🚨\n\n{bloque_mensaje}")
                             bloque_mensaje = ""
                             contador = 0
-                            time.sleep(2) # Pausa para no saturar la API de Telegram
+                            time.sleep(2)
 
-                # Si quedaron ofertas pendientes (menos de 15), se mandan al final
                 if bloque_mensaje:
                     enviar_telegram(f"🚨 **INFORME DE CARGOS (FINAL)** 🚨\n\n{bloque_mensaje}")
+
+                # --- LATIDO DE VIDA ---
+                if not hubo_novedades:
+                    # Obtenemos la hora actual en formato HH:MM
+                    hora_actual = time.strftime("%H:%M")
+                    # Enviamos un mensaje silencioso para no molestar con notificaciones
+                    enviar_telegram(f"⏳ _{hora_actual} hs - Búsqueda automática completada. Sin cargos nuevos._", silencioso=True)
 
             print("[*] Vuelta de monitoreo finalizada.", flush=True)
         except Exception as e:
@@ -127,21 +135,10 @@ def monitorear():
         
         time.sleep(900) # 15 minutos
 
-# --- SERVIDOR WEB MEJORADO ---
-def run_web_server():
-    # Render usa el puerto 10000 por defecto para el plan Free
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
-    print(f"[*] Servidor web escuchando en puerto {port}...", flush=True)
-    server.serve_forever()
-
 if __name__ == "__main__":
-    # 1. Iniciamos el servidor web en un hilo separado
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     
-    # 2. Le damos 5 segundos para que Render vea que el puerto está abierto
     time.sleep(5)
     
-    # 3. Iniciamos el monitoreo en el hilo principal
     monitorear()
