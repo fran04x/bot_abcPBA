@@ -18,12 +18,11 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INSECURE_SSL = os.environ.get("INSECURE_SSL", "false").strip().lower() in {"1", "true", "yes"}
 REQUEST_TIMEOUT = (10, 30)
-try:
-    MAX_TRACKED_OFFERS = int(os.environ.get("MAX_TRACKED_OFFERS", "5000"))
-    if MAX_TRACKED_OFFERS < 1:
-        raise ValueError("MAX_TRACKED_OFFERS debe ser mayor a 0")
-except ValueError:
-    MAX_TRACKED_OFFERS = 5000
+
+# Credenciales de Upstash Redis
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+
 try:
     TELEGRAM_MAX_MESSAGE_LEN = int(os.environ.get("TELEGRAM_MAX_MESSAGE_LEN", "4096"))
     if TELEGRAM_MAX_MESSAGE_LEN < 1:
@@ -164,9 +163,8 @@ def obtener_top_postulantes(session, id_oferta):
     return "<i>Sin datos</i>"
 
 def monitorear():
-    print("[*] Monitoreo silencioso iniciado...", flush=True)
-    ofertas_avisadas = set()
-    orden_ofertas = deque()
+    print("[*] Monitoreo silencioso iniciado con base de datos Upstash...", flush=True)
+    ofertas_avisadas_local = set() # Backup local por si falla internet
     buffer_ofertas = []
     ultimo_turno_enviado = None
 
@@ -196,7 +194,33 @@ def monitorear():
 
                     for info in hallazgos:
                         id_o = info.get('idoferta')
-                        if id_o not in ofertas_avisadas:
+                        es_nueva = False
+
+                        # LÓGICA DE MEMORIA EN LA NUBE CON UPSTASH
+                        if UPSTASH_URL and UPSTASH_TOKEN:
+                            base_url = UPSTASH_URL.rstrip('/')
+                            # Usamos el comando SADD (Set Add) de Redis vía REST
+                            url_redis = f"{base_url}/sadd/ofertas_enviadas/{id_o}"
+                            headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+                            try:
+                                resp = requests.get(url_redis, headers=headers, timeout=5)
+                                if resp.status_code == 200:
+                                    # La API devuelve 1 si se agregó (es nuevo), o 0 si ya estaba
+                                    if resp.json().get("result") == 1:
+                                        es_nueva = True
+                            except Exception as e:
+                                print(f"[-] Error conectando a Redis, usando RAM local: {e}", flush=True)
+                                # Fallback local
+                                if id_o not in ofertas_avisadas_local:
+                                    ofertas_avisadas_local.add(id_o)
+                                    es_nueva = True
+                        else:
+                            # Fallback si no pusiste las variables en Render
+                            if id_o not in ofertas_avisadas_local:
+                                ofertas_avisadas_local.add(id_o)
+                                es_nueva = True
+
+                        if es_nueva:
                             ranking = obtener_top_postulantes(session, id_o)
                             link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                             escuela = html.escape(str(info.get('escuela', '')))
@@ -210,11 +234,6 @@ def monitorear():
                             texto_oferta += "───────────────────\n"
 
                             buffer_ofertas.append(texto_oferta)
-                            ofertas_avisadas.add(id_o)
-                            orden_ofertas.append(id_o)
-                            while len(orden_ofertas) > MAX_TRACKED_OFFERS:
-                                id_viejo = orden_ofertas.popleft()
-                                ofertas_avisadas.discard(id_viejo)
 
                     ahora = datetime.now(tz_ar)
                     hora_actual = ahora.hour
@@ -241,9 +260,9 @@ def monitorear():
                             if bloque:
                                 enviar_telegram(f"🚨 <b>RESUMEN DE CARGOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
 
-                            buffer_ofertas.clear()
+                        buffer_ofertas.clear()
 
-                        ultimo_turno_enviado = hora_actual
+                    ultimo_turno_enviado = hora_actual
                 else:
                     print(f"[!] Consulta de ofertas devolvió estado {r.status_code}", flush=True)
 
