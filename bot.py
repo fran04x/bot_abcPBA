@@ -21,7 +21,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Masivo Activo")
+        self.wfile.write(b"Bot Activo")
 
 def run_web_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -38,7 +38,12 @@ class TLSAdapter(HTTPAdapter):
 
 def enviar_telegram(mensaje):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": CHAT_ID, 
+        "text": mensaje, 
+        "parse_mode": "Markdown", 
+        "disable_web_page_preview": True
+    }
     try:
         requests.post(url, json=payload)
     except:
@@ -54,13 +59,14 @@ def obtener_top_postulantes(session, id_oferta):
             if not docs: return "_Sin postulantes aún_"
             res = ""
             for i, p in enumerate(docs, 1):
-                res += f"  {i}º {p.get('apellido','')} | *{p.get('puntaje','0.00')} pts*\n"
+                nombre = f"{p.get('apellido','')} {p.get('nombre','')}".title()
+                res += f"  {i}º {nombre} | *{p.get('puntaje','0.00')} pts*\n"
             return res
     except: return "_Error en ranking_"
     return "_Sin datos_"
 
 def monitorear():
-    print("[*] Monitoreo masivo iniciado...", flush=True)
+    print("[*] Monitoreo iniciado (Bloques de 15)...", flush=True)
     ofertas_avisadas = set()
     
     while True:
@@ -69,28 +75,27 @@ def monitorear():
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
         
         try:
-            # Login
+            # Login ABC
             login_url = "https://login.abc.gob.ar/nidp/idff/sso?sid=2&sid=2"
             payload = {'option': 'credential', 'target': 'https://menu.abc.gob.ar/', 'Ecom_User_ID': CUIL, 'Ecom_Password': PASSWORD}
             session.post(login_url, data=payload, verify=False)
             
-            # Consulta (Designadas para probar)
+            # Consulta (Cambiado a 'Designada' para tus pruebas actuales)
             url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
             params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND estado:"Designada"', "rows": "1000", "wt": "json"}
             r = session.get(url_solr, params=params, verify=False)
             
             if r.status_code == 200:
                 docs = r.json().get("response", {}).get("docs", [])
-                # Filtro por nombre de cargo
-                nuevos_hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
+                hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
                 
-                print(f"[*] Encontrados: {len(nuevos_hallazgos)} maestros de grado.", flush=True)
+                print(f"[*] Encontrados: {len(hallazgos)} cargos.", flush=True)
 
                 bloque_mensaje = ""
-                contador_en_bloque = 0
+                contador = 0
                 ts = int(time.time() * 1000)
 
-                for info in nuevos_hallazgos:
+                for info in hallazgos:
                     id_o = info.get('idoferta')
                     if id_o not in ofertas_avisadas:
                         ranking = obtener_top_postulantes(session, id_o)
@@ -100,27 +105,27 @@ def monitorear():
                         bloque_mensaje += f"📚 **Área:** `{info.get('cargo')}`\n"
                         bloque_mensaje += f"🏆 **Top 3:**\n{ranking}"
                         bloque_mensaje += f"🔗 [POSTULARSE]({link})\n"
-                        bloque_mensaje += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+                        bloque_mensaje += "───────────────────\n"
                         
                         ofertas_avisadas.add(id_o)
-                        contador_en_bloque += 1
+                        contador += 1
 
-                        # Cada 5 ofertas, mandamos el mensaje y empezamos uno nuevo
-                        if contador_en_bloque >= 5:
-                            enviar_telegram(f"🚨 **CARGOS DETECTADOS** 🚨\n\n{bloque_mensaje}")
+                        # ENVIAR CADA 15 OFERTAS
+                        if contador >= 15:
+                            enviar_telegram(f"🚨 **INFORME DE CARGOS (15)** 🚨\n\n{bloque_mensaje}")
                             bloque_mensaje = ""
-                            contador_en_bloque = 0
-                            time.sleep(1) # Pausa técnica para Telegram
+                            contador = 0
+                            time.sleep(2) # Pausa para no saturar la API de Telegram
 
-                # Si sobraron ofertas sin mandar (menos de 5), las mandamos ahora
+                # Si quedaron ofertas pendientes (menos de 15), se mandan al final
                 if bloque_mensaje:
-                    enviar_telegram(f"🚨 **CARGOS DETECTADOS** 🚨\n\n{bloque_mensaje}")
+                    enviar_telegram(f"🚨 **INFORME DE CARGOS (FINAL)** 🚨\n\n{bloque_mensaje}")
 
             print("[*] Vuelta de monitoreo finalizada.", flush=True)
         except Exception as e:
             print(f"[-] Error: {e}", flush=True)
         
-        time.sleep(900)
+        time.sleep(900) # 15 minutos
 
 if __name__ == "__main__":
     threading.Thread(target=monitorear, daemon=True).start()
