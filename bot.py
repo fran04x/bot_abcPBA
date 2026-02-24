@@ -4,6 +4,7 @@ import requests
 import urllib3
 import time
 import threading
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
@@ -20,7 +21,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Intelligence-Mode Activo")
+        self.wfile.write(b"Bot en modo Diagnostico Activo")
 
 def run_web_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -35,44 +36,36 @@ class TLSAdapter(HTTPAdapter):
         kwargs['ssl_context'] = context
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
-# --- FUNCIÓN PARA OBTENER EL RANKING ---
-def obtener_top_postulantes(session, id_oferta):
-    url_postulantes = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.postulante/select"
-    params = {
-        "q": f"idoferta:{id_oferta}",
-        "sort": "puntaje desc",
-        "rows": "3",
-        "wt": "json"
-    }
-    try:
-        r = session.get(url_postulantes, params=params, verify=False)
-        if r.status_code == 200:
-            postulantes = r.json().get("response", {}).get("docs", [])
-            if not postulantes:
-                return "_Sin postulantes aún_"
-            
-            resumen = ""
-            for i, p in enumerate(postulantes, 1):
-                nombre = f"{p.get('apellido', '')} {p.get('nombre', '')}".title()
-                puntaje = p.get('puntaje', '0.00')
-                vuelta = p.get('numeroVuelta', '1')
-                prioridad = p.get('prioridadoferta', '-')
-                resumen += f"  {i}º {nombre} | *{puntaje} pts* (V:{vuelta} P:{prioridad})\n"
-            return resumen
-    except:
-        return "_Error al cargar ranking_"
-    return "_Sin datos_"
-
 def enviar_telegram(mensaje):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
-        requests.post(url, json=payload)
-    except:
-        pass
+        r = requests.post(url, json=payload)
+        print(f"[*] Telegram respondió: {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[-] Error enviando a Telegram: {e}", flush=True)
+
+def obtener_top_postulantes(session, id_oferta):
+    url_postulantes = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.postulante/select"
+    params = {"q": f"idoferta:{id_oferta}", "sort": "puntaje desc", "rows": "3", "wt": "json"}
+    try:
+        r = session.get(url_postulantes, params=params, verify=False)
+        if r.status_code == 200:
+            postulantes = r.json().get("response", {}).get("docs", [])
+            if not postulantes: return "_Sin postulantes aún_"
+            resumen = ""
+            for i, p in enumerate(postulantes, 1):
+                nombre = f"{p.get('apellido', '')} {p.get('nombre', '')}".title()
+                resumen += f"  {i}º {nombre} | *{p.get('puntaje', '0.00')} pts*\n"
+            return resumen
+    except: return "_Error en ranking_"
+    return "_Sin datos_"
 
 def monitorear():
-    print("[*] Monitoreo con Ranking de Postulantes iniciado...", flush=True)
+    print("[*] Iniciando monitoreo de prueba...", flush=True)
+    # MENSAJE DE PRUEBA INICIAL
+    enviar_telegram("🚀 **Test:** El bot arrancó y está buscando ofertas...")
+    
     ofertas_avisadas = set()
     
     while True:
@@ -86,47 +79,48 @@ def monitorear():
             payload = {'option': 'credential', 'target': 'https://menu.abc.gob.ar/', 'Ecom_User_ID': CUIL, 'Ecom_Password': PASSWORD}
             session.post(login_url, data=payload, verify=False)
             
-            # Consulta Ofertas
+            # Consulta
             url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
+            # PROBANDO CON DESIGNADA
             params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND estado:"Designada"', "rows": "1000", "wt": "json"}
             r = session.get(url_solr, params=params, verify=False)
             
             if r.status_code == 200:
                 docs = r.json().get("response", {}).get("docs", [])
-                nuevos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper() and str(o.get("jornada","")).upper() == "JC"]
+                print(f"[*] Total de ofertas 'Designada' encontradas: {len(docs)}", flush=True)
                 
-                # Filtrar solo los que no avisamos
-                nuevos_reales = []
-                for n in nuevos:
-                    if n.get("idoferta") not in ofertas_avisadas:
-                        nuevos_reales.append(n)
-                        ofertas_avisadas.add(n.get("idoferta"))
+                # FILTRO RELAJADO PARA PRUEBAS: Cualquier cargo que diga Maestro de Grado
+                nuevos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
+                print(f"[*] Ofertas que pasaron el filtro de nombre: {len(nuevos)}", flush=True)
 
-                if nuevos_reales:
-                    cuerpo = "🚨 **RANKING DE JORNADA COMPLETA** 🚨\n\n"
-                    ts = int(time.time() * 1000)
-                    
-                    for info in nuevos_reales:
-                        id_o = info.get('idoferta')
-                        id_d = info.get('iddetalle') or id_o
-                        
-                        # Buscamos el Top 3 para esta escuela
+                cuerpo = "🚨 **RESULTADOS DE PRUEBA (DESIGNADAS)** 🚨\n\n"
+                encontró_algo = False
+                ts = int(time.time() * 1000)
+
+                for info in nuevos:
+                    id_o = info.get('idoferta')
+                    if id_o not in ofertas_avisadas:
+                        encontró_algo = True
                         ranking = obtener_top_postulantes(session, id_o)
-                        
-                        link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={id_d}&_t={ts}"
+                        link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                         
                         cuerpo += f"🏫 **Escuela:** {info.get('escuela')}\n"
                         cuerpo += f"📚 **Área:** `{info.get('cargo')}`\n"
-                        cuerpo += f"👥 **Curso/Div:** {info.get('curso')} - {info.get('division')}\n"
-                        cuerpo += f"🏆 **Top 3 Candidatos:**\n{ranking}"
-                        cuerpo += f"🔗 [CLIC AQUÍ PARA POSTULARSE]({link})\n"
+                        cuerpo += f"🏆 **Top 3:**\n{ranking}\n"
+                        cuerpo += f"🔗 [POSTULARSE]({link})\n"
                         cuerpo += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-                    
+                        ofertas_avisadas.add(id_o)
+                        # Limitamos a 5 para no explotar Telegram en el test
+                        if len(ofertas_avisadas) > 5: break
+
+                if encontró_algo:
                     enviar_telegram(cuerpo)
-            print("[*] Vuelta de monitoreo completa.", flush=True)
+            else:
+                print(f"[-] Error en el ABC: {r.status_code}", flush=True)
         except Exception as e:
-            print(f"[-] Error: {e}", flush=True)
+            print(f"[-] Error crítico: {e}", flush=True)
         
+        print("[*] Esperando 15 min...", flush=True)
         time.sleep(900)
 
 if __name__ == "__main__":
