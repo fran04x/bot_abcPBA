@@ -50,9 +50,13 @@ class TLSAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         if INSECURE_SSL:
             context = create_urllib3_context()
-            context.set_ciphers("DEFAULT@SECLEVEL=1")
+            # Bajamos el nivel de seguridad a 0 y permitimos todos los cifrados
+            context.set_ciphers("ALL:@SECLEVEL=0")
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+            # Esta línea fuerza a Python a aceptar conexiones con servidores antiguos
+            if hasattr(ssl, 'OP_LEGACY_SERVER_CONNECT'):
+                context.options |= ssl.OP_LEGACY_SERVER_CONNECT
             kwargs['ssl_context'] = context
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
