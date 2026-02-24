@@ -5,6 +5,7 @@ import urllib3
 import time
 import threading
 import json
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
@@ -21,7 +22,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Masivo 15-Batch Activo")
+        self.wfile.write(b"Bot Resumen Diario Activo")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -45,7 +46,7 @@ def enviar_telegram(mensaje, silencioso=False):
         "text": mensaje, 
         "parse_mode": "Markdown", 
         "disable_web_page_preview": True,
-        "disable_notification": silencioso # Para que el latido no haga sonar el celular
+        "disable_notification": silencioso
     }
     try:
         requests.post(url, json=payload)
@@ -69,8 +70,13 @@ def obtener_top_postulantes(session, id_oferta):
     return "_Sin datos_"
 
 def monitorear():
-    print("[*] Monitoreo iniciado con latido de vida...", flush=True)
+    print("[*] Monitoreo silencioso iniciado...", flush=True)
     ofertas_avisadas = set()
+    buffer_ofertas = [] # La "bolsa" donde guardamos los cargos hasta que sea la hora
+    ultimo_turno_enviado = None # Para recordar si ya mandamos el de las 9 o las 21
+    
+    # Configuración de zona horaria (GMT-3 para Argentina)
+    tz_ar = timezone(timedelta(hours=-3))
     
     while True:
         session = requests.Session()
@@ -78,7 +84,7 @@ def monitorear():
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
         
         try:
-            # Login ABC
+            # Login
             login_url = "https://login.abc.gob.ar/nidp/idff/sso?sid=2&sid=2"
             payload = {'option': 'credential', 'target': 'https://menu.abc.gob.ar/', 'Ecom_User_ID': CUIL, 'Ecom_Password': PASSWORD}
             session.post(login_url, data=payload, verify=False)
@@ -92,53 +98,67 @@ def monitorear():
                 docs = r.json().get("response", {}).get("docs", [])
                 hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
                 
-                bloque_mensaje = ""
-                contador = 0
                 ts = int(time.time() * 1000)
-                hubo_novedades = False # Empezamos asumiendo que no hay nada nuevo
 
+                # 1. BÚSQUEDA Y ALMACENAMIENTO SILENCIOSO
                 for info in hallazgos:
                     id_o = info.get('idoferta')
                     if id_o not in ofertas_avisadas:
-                        hubo_novedades = True # ¡Encontramos algo nuevo!
                         ranking = obtener_top_postulantes(session, id_o)
                         link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                         
-                        bloque_mensaje += f"🏫 **Escuela:** {info.get('escuela')}\n"
-                        bloque_mensaje += f"📚 **Área:** `{info.get('cargo')}`\n"
-                        bloque_mensaje += f"🏆 **Top 3:**\n{ranking}"
-                        bloque_mensaje += f"🔗 [POSTULARSE]({link})\n"
-                        bloque_mensaje += "───────────────────\n"
+                        texto_oferta = f"🏫 **Escuela:** {info.get('escuela')}\n"
+                        texto_oferta += f"📚 **Área:** `{info.get('cargo')}`\n"
+                        texto_oferta += f"🏆 **Top 3:**\n{ranking}"
+                        texto_oferta += f"🔗 [POSTULARSE]({link})\n"
+                        texto_oferta += "───────────────────\n"
                         
+                        # Guardamos en la bolsa en vez de mandarlo
+                        buffer_ofertas.append(texto_oferta)
                         ofertas_avisadas.add(id_o)
-                        contador += 1
 
-                        if contador >= 15:
-                            enviar_telegram(f"🚨 **INFORME DE CARGOS (15)** 🚨\n\n{bloque_mensaje}")
-                            bloque_mensaje = ""
-                            contador = 0
-                            time.sleep(2)
+                # 2. VERIFICACIÓN DE HORARIO PARA ENVIAR
+                ahora = datetime.now(tz_ar)
+                hora_actual = ahora.hour
+                
+                # ¿Son las 9 AM o las 9 PM (21 hrs)?
+                es_hora_de_envio = (hora_actual == 9 and ultimo_turno_enviado != 9) or (hora_actual == 21 and ultimo_turno_enviado != 21)
 
-                if bloque_mensaje:
-                    enviar_telegram(f"🚨 **INFORME DE CARGOS (FINAL)** 🚨\n\n{bloque_mensaje}")
+                if es_hora_de_envio:
+                    hora_str = ahora.strftime("%H:%M")
+                    
+                    if not buffer_ofertas:
+                        enviar_telegram(f"⏳ _{hora_str} hs - Resumen del turno: Sin cargos nuevos._", silencioso=True)
+                    else:
+                        bloque = ""
+                        contador = 0
+                        for txt in buffer_ofertas:
+                            bloque += txt
+                            contador += 1
+                            if contador >= 15:
+                                enviar_telegram(f"🚨 **RESUMEN DE CARGOS ({hora_str} hs)** 🚨\n\n{bloque}")
+                                bloque = ""
+                                contador = 0
+                                time.sleep(2)
+                                
+                        if bloque:
+                            enviar_telegram(f"🚨 **RESUMEN DE CARGOS ({hora_str} hs)** 🚨\n\n{bloque}")
+                        
+                        # Vaciamos la bolsa después de mandar todo
+                        buffer_ofertas.clear()
+                    
+                    # Registramos que ya se mandó el turno para no repetir
+                    ultimo_turno_enviado = hora_actual
 
-                # --- LATIDO DE VIDA ---
-                if not hubo_novedades:
-                    # Obtenemos la hora actual en formato HH:MM
-                    hora_actual = time.strftime("%H:%M")
-                    # Enviamos un mensaje silencioso para no molestar con notificaciones
-                    enviar_telegram(f"⏳ _{hora_actual} hs - Búsqueda automática completada. Sin cargos nuevos._", silencioso=True)
-
-            print("[*] Vuelta de monitoreo finalizada.", flush=True)
+            print(f"[*] Revisión oculta finalizada. Ofertas en espera: {len(buffer_ofertas)}", flush=True)
         except Exception as e:
             print(f"[-] Error: {e}", flush=True)
         
-        time.sleep(900) # 15 minutos
+        time.sleep(900)
 
 if __name__ == "__main__":
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     
     time.sleep(5)
-    
     monitorear()
