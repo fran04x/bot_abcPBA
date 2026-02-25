@@ -39,7 +39,7 @@ Para que el bot funcione correctamente en cualquier entorno (como Render), debes
 2. **Repositorio:** Sube este código a un repositorio en GitHub.
 3. **Hosting:** Ve a [Render](https://render.com/), crea un nuevo **Web Service** conectado a tu repositorio.
 4. **Configuración de Render:**
-   - **Build Command:** `pip install requests` (o usa un `requirements.txt` si lo agregas).
+   - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `python bot.py`
    - Configura las variables de entorno detalladas arriba.
 5. **Anti-Hibernación:** Copia la URL pública que te da Render (ej. `https://mi-bot-abc.onrender.com`) y configúrala en [cron-job.org](https://cron-job.org/) para que le envíe una petición GET cada **10 minutos**.
