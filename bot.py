@@ -1,161 +1,79 @@
 import os
 import ssl
-import html
 import requests
 import urllib3
 import time
 import threading
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURACIÓN ---
 CUIL = os.environ.get("CUIL")
 PASSWORD = os.environ.get("PASSWORD")
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-INSECURE_SSL = os.environ.get("INSECURE_SSL", "false").strip().lower() in {"1", "true", "yes"}
-REQUEST_TIMEOUT = (10, 30)
-
-# Credenciales de Upstash Redis
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
-
-try:
-    TELEGRAM_MAX_MESSAGE_LEN = int(os.environ.get("TELEGRAM_MAX_MESSAGE_LEN", "4096"))
-    if TELEGRAM_MAX_MESSAGE_LEN < 1:
-        raise ValueError("TELEGRAM_MAX_MESSAGE_LEN debe ser mayor a 0")
-except ValueError:
-    TELEGRAM_MAX_MESSAGE_LEN = 4096
-TELEGRAM_MAX_MESSAGE_LEN = min(TELEGRAM_MAX_MESSAGE_LEN, 4096)
-
-if INSECURE_SSL:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Activo")
-        
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.wfile.write(b"Bot Live-Dashboard Activo")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), SimpleHandler)
-    print(f"[*] Servidor web escuchando en puerto {port}...", flush=True)
     server.serve_forever()
 
 class TLSAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
-        if INSECURE_SSL:
-            context = create_urllib3_context()
-            # Bajamos el nivel de seguridad a 0 y permitimos todos los cifrados
-            context.set_ciphers("ALL:@SECLEVEL=0")
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            # Esta línea fuerza a Python a aceptar conexiones con servidores antiguos
-            if hasattr(ssl, 'OP_LEGACY_SERVER_CONNECT'):
-                context.options |= ssl.OP_LEGACY_SERVER_CONNECT
-            kwargs['ssl_context'] = context
+        context = create_urllib3_context()
+        context.set_ciphers("DEFAULT@SECLEVEL=1")
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = context
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
+# --- FUNCIONES DE TELEGRAM ---
 def enviar_telegram(mensaje, silencioso=False):
-    if not TOKEN or not CHAT_ID:
-        print("[-] TELEGRAM_TOKEN o TELEGRAM_CHAT_ID no configurados.", flush=True)
-        return
-
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    def enviar_parte(texto):
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": texto,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            "disable_notification": silencioso
-        }
+    payload = {
+        "chat_id": CHAT_ID, 
+        "text": mensaje, 
+        "parse_mode": "Markdown", 
+        "disable_web_page_preview": True,
+        "disable_notification": silencioso
+    }
+    try:
+        r = requests.post(url, json=payload).json()
+        if r.get("ok"):
+            # Devolvemos el ID del mensaje para poder editarlo después
+            return r["result"]["message_id"]
+    except:
+        pass
+    return None
 
-        payload_plain = {
-            "chat_id": CHAT_ID,
-            "text": texto,
-            "disable_web_page_preview": True,
-            "disable_notification": silencioso
-        }
+def editar_mensaje_telegram(message_id, nuevo_texto):
+    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+    payload = {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": nuevo_texto,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    try:
+        requests.post(url, json=payload)
+    except:
+        pass
 
-        try:
-            response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            return
-        except requests.RequestException as error:
-            status = getattr(getattr(error, "response", None), "status_code", None)
-            detalle = None
-            if getattr(error, "response", None) is not None:
-                try:
-                    detalle = error.response.json().get("description")
-                except (ValueError, TypeError, KeyError):
-                    detalle = error.response.text
-
-            if status is not None and 400 <= status < 500:
-                print(f"[!] Error HTML en Telegram ({status}): {detalle}. Reintentando en texto plano...", flush=True)
-                try:
-                    plain_response = requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
-                    plain_response.raise_for_status()
-                    print("[*] Mensaje enviado en texto plano tras fallback.", flush=True)
-                    return
-                except requests.RequestException as fallback_error:
-                    print(f"[-] Error enviando Telegram (fallback texto plano): {fallback_error}", flush=True)
-                    return
-
-            print(f"[-] Error enviando Telegram: {error}", flush=True)
-
-    max_len = TELEGRAM_MAX_MESSAGE_LEN
-    if len(mensaje) <= max_len:
-        enviar_parte(mensaje)
-        return
-
-    print(f"[!] Mensaje largo ({len(mensaje)} chars). Fragmentando en partes <= {max_len}.", flush=True)
-    partes = []
-    bloque = ""
-    for linea in mensaje.splitlines(keepends=True):
-        if len(linea) > max_len:
-            if bloque:
-                partes.append(bloque)
-                bloque = ""
-            inicio = 0
-            while inicio < len(linea):
-                partes.append(linea[inicio:inicio + max_len])
-                inicio += max_len
-            continue
-
-        if len(bloque) + len(linea) <= max_len:
-            bloque += linea
-        else:
-            partes.append(bloque)
-            bloque = linea
-
-    if bloque:
-        partes.append(bloque)
-
-    for idx, parte in enumerate(partes, start=1):
-        if len(partes) > 1:
-            encabezado = f"<i>Parte {idx}/{len(partes)}</i>\n"
-            if len(encabezado) + len(parte) <= max_len:
-                enviar_parte(encabezado + parte)
-            else:
-                enviar_parte(parte)
-        else:
-            enviar_parte(parte)
-
+# --- FUNCIÓN DE RANKING (FILTRANDO INACTIVOS) ---
 def obtener_top_postulantes(session, id_oferta):
     url_p = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.postulante/select"
-    
-    # Pedimos 10 postulantes para tener margen de descartar a los inactivos
     params = {"q": f"idoferta:{id_oferta}", "sort": "puntaje desc", "rows": "10", "wt": "json"}
-    
     try:
         r = session.get(url_p, params=params, verify=False)
         if r.status_code == 200:
@@ -163,164 +81,146 @@ def obtener_top_postulantes(session, id_oferta):
             if not docs: return "_Sin postulantes aún_"
             
             res = ""
-            activos_mostrados = 0
-            
+            activos = 0
             for p in docs:
-                estado_post = str(p.get('estadopostulacion', '')).upper()
-                designado = str(p.get('designado', '')).upper()
+                est = str(p.get('estadopostulacion', '')).upper()
+                desig = str(p.get('designado', '')).upper()
                 
-                # FILTRO: Ignorar a los inactivos o ya designados
-                if estado_post != "ACTIVA" or designado == "S" or designado == "Y":
-                    continue # Salta a este postulante y pasa al siguiente
+                if est != "ACTIVA" or desig in ["S", "Y"]: continue
                 
                 nombre = f"{p.get('apellido','')} {p.get('nombre','')}".title()
-                activos_mostrados += 1
+                activos += 1
+                res += f"  {activos}º {nombre} | *{p.get('puntaje','0.00')} pts*\n"
+                if activos >= 3: break
                 
-                res += f"  {activos_mostrados}º {nombre} | *{p.get('puntaje','0.00')} pts*\n"
-                
-                # Cortamos cuando ya juntamos a los 3 activos con más puntaje
-                if activos_mostrados >= 3:
-                    break 
-            
-            # Si revisó los 10 y todos estaban inactivos:
-            if activos_mostrados == 0:
-                return "_Postulantes inactivos (¡Vía libre!)_"
-                
+            if activos == 0: return "_Postulantes inactivos (¡Vía libre!)_"
             return res
-    except: 
-        return "_Error en ranking_"
-        
+    except: return "_Error en ranking_"
     return "_Sin datos_"
 
+# --- MOTOR PRINCIPAL ---
 def monitorear():
-    print("[*] Monitoreo silencioso en tiempo real iniciado con Upstash...", flush=True)
-    ofertas_avisadas_local = set() # Backup local por si falla internet
+    print("[*] Dashboard en vivo iniciado...", flush=True)
+    ofertas_avisadas = set()
     buffer_ofertas = []
-    
-    # Variables para el control de los mensajes de "prueba de vida"
-    HORAS_REPORTE = {6, 9, 14, 17, 20, 21}
-    ultimo_reporte_enviado = None
-
+    ultimo_turno = None 
     tz_ar = timezone(timedelta(hours=-3))
     
+    # --- MEMORIA RAM DEL BOT ---
+    mensajes_enviados = {} # {msg_id: "Texto completo del mensaje"}
+    ofertas_mapeo = {} # {id_oferta: {"msg_id": 123, "link": "string exacto a reemplazar"}}
+    
     while True:
+        session = requests.Session()
+        session.mount('https://', TLSAdapter())
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        
         try:
-            with requests.Session() as session:
-                session.mount('https://', TLSAdapter())
-                session.headers.update({'User-Agent': 'Mozilla/5.0'})
-
-                login_url = "https://login.abc.gob.ar/nidp/idff/sso?sid=2&sid=2"
-                payload = {'option': 'credential', 'target': 'https://menu.abc.gob.ar/', 'Ecom_User_ID': CUIL, 'Ecom_Password': PASSWORD}
-                login_response = session.post(login_url, data=payload, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
-                if login_response.status_code != 200:
-                    print(f"[!] Login con estado inesperado: {login_response.status_code}", flush=True)
-
-                url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
-                params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND estado:"Designada"', "rows": "1000", "wt": "json"}
-                r = session.get(url_solr, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
+            # Login
+            login_url = "https://login.abc.gob.ar/nidp/idff/sso?sid=2&sid=2"
+            payload = {'option': 'credential', 'target': 'https://menu.abc.gob.ar/', 'Ecom_User_ID': CUIL, 'Ecom_Password': PASSWORD}
+            session.post(login_url, data=payload, verify=False)
             
-                if r.status_code == 200:
-                    docs = r.json().get("response", {}).get("docs", [])
-                    hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
+            # ATENCIÓN: Ahora pedimos Publicadas Y Designadas juntas
+            url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
+            query = 'descdistrito:"GENERAL PUEYRREDON" AND (estado:"Publicada" OR estado:"Designada")'
+            params = {"q": query, "rows": "1000", "wt": "json"}
+            r = session.get(url_solr, params=params, verify=False)
+            
+            if r.status_code == 200:
+                docs = r.json().get("response", {}).get("docs", [])
+                ts = int(time.time() * 1000)
+
+                for info in docs:
+                    cargo_str = str(info.get("cargo","")).upper()
+                    if "MAESTRO DE GRADO" not in cargo_str: continue
+                        
+                    id_o = info.get('idoferta')
+                    estado = str(info.get('estado', '')).upper()
                     
-                    ts = int(time.time() * 1000)
-
-                    for info in hallazgos:
-                        id_o = info.get('idoferta')
-                        es_nueva = False
-
-                        # LÓGICA DE MEMORIA EN LA NUBE CON UPSTASH
-                        if UPSTASH_URL and UPSTASH_TOKEN:
-                            base_url = UPSTASH_URL.rstrip('/')
-                            url_redis = f"{base_url}/sadd/ofertas_enviadas/{id_o}"
-                            headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-                            try:
-                                resp = requests.get(url_redis, headers=headers, timeout=5)
-                                if resp.status_code == 200:
-                                    if resp.json().get("result") == 1:
-                                        es_nueva = True
-                            except Exception as e:
-                                print(f"[-] Error conectando a Redis, usando RAM local: {e}", flush=True)
-                                if id_o not in ofertas_avisadas_local:
-                                    ofertas_avisadas_local.add(id_o)
-                                    es_nueva = True
-                        else:
-                            if id_o not in ofertas_avisadas_local:
-                                ofertas_avisadas_local.add(id_o)
-                                es_nueva = True
-
-                        if es_nueva:
+                    # CASO 1: Cargo nuevo para postularse
+                    if estado == "PUBLICADA":
+                        if id_o not in ofertas_avisadas:
                             ranking = obtener_top_postulantes(session, id_o)
                             link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
-                            escuela = html.escape(str(info.get('escuela', '')))
-                            cargo = html.escape(str(info.get('cargo', '')))
-                            link_escapado = html.escape(link, quote=True)
                             
-                            texto_oferta = f"🏫 <b>Escuela:</b> {escuela}\n"
-                            texto_oferta += f"📚 <b>Área:</b> <code>{cargo}</code>\n"
-                            texto_oferta += f"🏆 <b>Top 3:</b>\n{ranking}"
-                            texto_oferta += f"🔗 <a href=\"{link_escapado}\">VER ESCUELA</a>\n"
-                            texto_oferta += "───────────────────\n"
+                            # Guardamos la línea exacta para poder buscarla y borrarla después
+                            linea_link = f"🔗 [POSTULARSE]({link})"
+                            
+                            texto = f"🏫 **Escuela:** {info.get('escuela')}\n"
+                            texto += f"📚 **Área:** `{info.get('cargo')}`\n"
+                            texto += f"🏆 **Top 3:**\n{ranking}"
+                            texto += f"{linea_link}\n"
+                            texto += "───────────────────\n"
+                            
+                            buffer_ofertas.append({"id": id_o, "texto": texto, "link_exacto": linea_link})
+                            ofertas_avisadas.add(id_o)
+                            
+                    # CASO 2: El cargo se cerró y alguien lo agarró
+                    elif estado == "DESIGNADA":
+                        if id_o in ofertas_mapeo:
+                            datos = ofertas_mapeo[id_o]
+                            msg_id = datos["msg_id"]
+                            link_viejo = datos["link"]
+                            
+                            if msg_id in mensajes_enviados:
+                                texto_actual = mensajes_enviados[msg_id]
+                                # Reemplazamos el link por el aviso de cerrado
+                                nuevo_texto = texto_actual.replace(link_viejo, "❌ **[CARGO YA DESIGNADO]**")
+                                
+                                editar_mensaje_telegram(msg_id, nuevo_texto)
+                                mensajes_enviados[msg_id] = nuevo_texto 
+                            
+                            # Ya no hace falta vigilarlo
+                            del ofertas_mapeo[id_o]
 
-                            buffer_ofertas.append(texto_oferta)
-
-                    ahora = datetime.now(tz_ar)
-                    hora_actual = ahora.hour
+                # --- LÓGICA DE ENVÍO POR TURNOS (9 AM y 9 PM) ---
+                ahora = datetime.now(tz_ar)
+                hora_actual = ahora.hour
+                es_hora = (hora_actual == 9 and ultimo_turno != 9) or (hora_actual == 21 and ultimo_turno != 21)
+                
+                if es_hora:
                     hora_str = ahora.strftime("%H:%M")
-
-                    # CASO 1: HAY OFERTAS NUEVAS (Se envían INMEDIATAMENTE)
-                    if buffer_ofertas:
-                        bloque = ""
+                    if not buffer_ofertas:
+                        enviar_telegram(f"⏳ _{hora_str} hs - Resumen: Sin cargos nuevos._", silencioso=True)
+                    else:
+                        bloque_texto = f"🚨 **RESUMEN DE CARGOS ({hora_str} hs)** 🚨\n\n"
+                        datos_bloque = []
                         contador = 0
-                        for txt in buffer_ofertas:
-                            bloque += txt
+                        
+                        for obj in buffer_ofertas:
+                            bloque_texto += obj["texto"]
+                            datos_bloque.append(obj)
                             contador += 1
+                            
                             if contador >= 15:
-                                enviar_telegram(f"🚨 <b>NUEVOS CARGOS ENCONTRADOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
-                                bloque = ""
+                                msg_id = enviar_telegram(bloque_texto)
+                                if msg_id:
+                                    mensajes_enviados[msg_id] = bloque_texto
+                                    for d in datos_bloque:
+                                        ofertas_mapeo[d["id"]] = {"msg_id": msg_id, "link": d["link_exacto"]}
+                                
+                                bloque_texto = f"🚨 **RESUMEN CONTINUACIÓN** 🚨\n\n"
+                                datos_bloque = []
                                 contador = 0
                                 time.sleep(2)
                                 
-                        if bloque:
-                            enviar_telegram(f"🚨 <b>NUEVOS CARGOS ENCONTRADOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
-
-                        buffer_ofertas.clear()
+                        if contador > 0:
+                            msg_id = enviar_telegram(bloque_texto)
+                            if msg_id:
+                                mensajes_enviados[msg_id] = bloque_texto
+                                for d in datos_bloque:
+                                    ofertas_mapeo[d["id"]] = {"msg_id": msg_id, "link": d["link_exacto"]}
                         
-                        # Si justo enviamos una alerta en una hora de reporte, contamos el reporte como cumplido
-                        if hora_actual in HORAS_REPORTE:
-                            ultimo_reporte_enviado = hora_actual
+                        buffer_ofertas.clear()
+                    ultimo_turno = hora_actual
 
-                    # CASO 2: NO HAY OFERTAS NUEVAS, PERO ES HORA DE REPORTE DE SALUD
-                    elif hora_actual in HORAS_REPORTE and ultimo_reporte_enviado != hora_actual:
-                        enviar_telegram(f"⏳ <i>{hora_str} hs - Bot activo: Monitoreando sin encontrar cargos nuevos por el momento.</i>", silencioso=True)
-                        ultimo_reporte_enviado = hora_actual
-
-                else:
-                    print(f"[!] Consulta de ofertas devolvió estado {r.status_code}", flush=True)
-
-            print(f"[*] Revisión finalizada ({ahora.strftime('%H:%M')}).", flush=True)
-        except requests.RequestException as error:
-            print(f"[-] Error de red: {error}", flush=True)
         except Exception as e:
-            print(f"[-] Error: {e}", flush=True)
-        
-        # Sigue durmiendo 15 minutos exactos entre cada chequeo
+            pass
         time.sleep(900)
 
 if __name__ == "__main__":
-    faltantes = [
-        key for key, value in {
-            "CUIL": CUIL,
-            "PASSWORD": PASSWORD,
-            "TELEGRAM_TOKEN": TOKEN,
-            "TELEGRAM_CHAT_ID": CHAT_ID,
-        }.items() if not value
-    ]
-    if faltantes:
-        raise RuntimeError(f"Faltan variables de entorno obligatorias: {', '.join(faltantes)}")
-
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
-    
     time.sleep(5)
     monitorear()
