@@ -773,7 +773,7 @@ def monitorear():
                                     txt = f"🏫 <b>Escuela:</b> <code>{escuela}</code>\n"
                                     txt += f"📚 <b>Área:</b> {cargo}\n"
                                     txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
-                                    if curso != "-" or division != "-":
+                                        if curso != "-" or division != "-":
                                     txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                                     txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
