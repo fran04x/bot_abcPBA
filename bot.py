@@ -26,6 +26,7 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 # --- MEMORIA GLOBAL ---
 CACHE_RESULTADOS = []
 MENSAJES_ENVIADOS = set()
+INICIO_BOT_TS = time.time()
 
 try:
     TELEGRAM_MAX_MESSAGE_LEN = int(os.environ.get("TELEGRAM_MAX_MESSAGE_LEN", "4096"))
@@ -176,22 +177,34 @@ def escuchar_botones():
                                 continue
                             
                             ultimo_clic = ahora
+                            if (ahora - INICIO_BOT_TS) < 60 or not CACHE_RESULTADOS:
+                                requests.get(
+                                    url_answer,
+                                    params={
+                                        "callback_query_id": cb_id,
+                                        "text": "⏳ El bot recién inició. Esperá 1 minuto e intentá de nuevo.",
+                                        "show_alert": False
+                                    },
+                                    timeout=REQUEST_TIMEOUT
+                                )
+                                enviar_telegram(
+                                    "⏳ <i>El bot recién inició o aún no terminó de cargar datos. Esperá 1 minuto e intentá de nuevo.</i>",
+                                    silencioso=True,
+                                    es_permanente=False
+                                )
+                                continue
+
                             requests.get(url_answer, params={"callback_query_id": cb_id}, timeout=REQUEST_TIMEOUT)
-                            
+
                             limpiar_chat()
-                            
-                            if not CACHE_RESULTADOS:
-                                enviar_telegram("⏳ <i>El bot recién inició o no hay cargos activos. Intentá de nuevo en unos minutos.</i>", silencioso=True, es_permanente=False)
-                            else:
-                                enviar_telegram("📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>", es_permanente=False)
-                                bloque = ""
-                                for idx, txt in enumerate(CACHE_RESULTADOS, 1):
-                                    bloque += txt
-                                    if idx % 10 == 0 or idx == len(CACHE_RESULTADOS):
-                                        poner_boton = (idx == len(CACHE_RESULTADOS))
-                                        enviar_telegram(bloque, con_boton=poner_boton, es_permanente=False)
-                                        bloque = ""
-                                        time.sleep(1) 
+                            enviar_telegram("📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>", es_permanente=False)
+                            bloque = ""
+                            for idx, txt in enumerate(CACHE_RESULTADOS, 1):
+                                bloque += txt
+                                if idx % 10 == 0 or idx == len(CACHE_RESULTADOS):
+                                    enviar_telegram(bloque, es_permanente=False)
+                                    bloque = ""
+                                    time.sleep(1)
             else:
                 print(f"[!] getUpdates devolvió {r.status_code}: {r.text}", flush=True)
         except Exception as e:
