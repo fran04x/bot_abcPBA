@@ -762,6 +762,11 @@ def monitorear():
                                 cargo = html.escape(str(info.get('cargo', 'N/A')))
                                 curso = html.escape(str(info.get('curso', '-')))
                                 division = html.escape(str(info.get('division', '-')))
+                                direccion = html.escape(str(info.get('domiciliodesempeno', info.get('domicilio', 'N/A'))).strip())
+                                revista = html.escape(str(info.get('supl_revista', 'N/A')))
+                                cierre_oferta = html.escape(formatear_fecha_argentina(info.get('finoferta'), tz_ar))
+                                desde = html.escape(formatear_fecha_argentina(info.get('supl_desde'), tz_ar))
+                                hasta = html.escape(formatear_fecha_argentina(info.get('supl_hasta'), tz_ar))
 
                                 jornada_raw = str(info.get('jornada', '')).upper()
                                 if "JC" in jornada_raw:
@@ -778,11 +783,16 @@ def monitorear():
                                     ranking = obtener_top_postulantes(session, id_o)
                                     link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                                     txt = f"🏫 <b>Escuela:</b> <code>{escuela}</code>\n"
+                                    if direccion not in ("N/A", "-", ""):
+                                        txt += f"📍 <b>Dirección:</b> {direccion}\n"
                                     txt += f"📚 <b>Área:</b> {cargo}\n"
                                     txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
+                                    txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
                                     if curso != "-" or division != "-":
                                         txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                                     txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
+                                    txt += f"📝 <b>Revista:</b> {revista}\n"
+                                    txt += f"📅 <b>Período:</b> {desde} al {hasta}\n"
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
                                     txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
                                     txt += "───────────────────\n"
@@ -794,11 +804,16 @@ def monitorear():
 
                                 elif cambio_a_designada:
                                     txt = f"🏫 <b>Escuela:</b> {escuela}\n"
+                                    if direccion not in ("N/A", "-", ""):
+                                        txt += f"📍 <b>Dirección:</b> {direccion}\n"
                                     txt += f"📚 <b>Área:</b> {cargo}\n"
                                     txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
+                                    txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
                                     if curso != "-" or division != "-":
                                         txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                                     txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
+                                    txt += f"📝 <b>Revista:</b> {revista}\n"
+                                    txt += f"📅 <b>Período:</b> {desde} al {hasta}\n"
                                     txt += "───────────────────\n"
                                     buffer_cerradas.append((id_o, txt))
 
