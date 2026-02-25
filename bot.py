@@ -661,12 +661,34 @@ def monitorear():
                         session.post(login_url, data=payload, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
 
                         url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
-                        params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND (estado:"Publicada" OR estado:"Designada")', "rows": "1000", "wt": "json"}
+                        # 1. Agregamos el sort en la API para que no nos oculte las ofertas nuevas
+                        params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND (estado:"Publicada" OR estado:"Designada")', "rows": "1000", "wt": "json", "sort": "idoferta desc"}
                         r = session.get(url_solr, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
 
                         if r.status_code == 200:
                             docs = r.json().get("response", {}).get("docs", [])
                             hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo", "")).upper()]
+                            
+                            # 2. Ordenamos internamente por fecha de inicio (De más antigua a más nueva)
+                            def extraer_timestamp(valor):
+                                if not valor or valor == "-": return 0.0
+                                if isinstance(valor, (list, tuple)):
+                                    if not valor: return 0.0
+                                    valor = valor[0]
+                                try:
+                                    if isinstance(valor, (int, float)): return float(valor)
+                                    texto = str(valor).strip()
+                                    if not texto: return 0.0
+                                    if texto.isdigit(): return float(texto)
+                                    dt = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+                                    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                                    return dt.timestamp()
+                                except Exception:
+                                    return 0.0
+                                    
+                            hallazgos.sort(key=lambda x: extraer_timestamp(x.get('iniciooferta')))
+                            # -------------------------------------------------------------------------
+                            
                             ts = int(time.time() * 1000)
 
                             procesados_en_vuelta = set()
@@ -730,11 +752,7 @@ def monitorear():
 
                                 if estado_actual == "PUBLICADA":
                                     ranking = obtener_top_postulantes(session, id_o)
-                                    id_detalle = info.get('iddetalle', id_o)
-                                    
-                                    # Generación de ambos links
-                                    link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={id_detalle}&_t={ts}"
-                                    link_postularse = f"https://misaplicaciones5.abc.gob.ar/postulacionAPD/addPostulacion/{id_detalle}?_={ts}"
+                                    link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
 
                                     txt = f"🏫 <b>Escuela:</b> {escuela}\n"
                                     txt += f"📚 <b>Área:</b> <code>{cargo}</code>\n"
@@ -743,9 +761,7 @@ def monitorear():
                                         txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                                     txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
-                                    
-                                    # Agregamos el botón de POSTULARSE al lado de VER ESCUELA
-                                    txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a> | 📝 <a href=\"{html.escape(link_postularse, quote=True)}\">POSTULARSE</a>\n"
+                                    txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
                                     txt += "───────────────────\n"
 
                                     temp_cache.append(txt)
