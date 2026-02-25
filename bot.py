@@ -89,7 +89,6 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
             response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            # Si NO es permanente, guardamos su ID para poder borrarlo después
             if data.get("ok") and not es_permanente:
                 MENSAJES_ENVIADOS.add(data["result"]["message_id"])
             return
@@ -142,6 +141,17 @@ def escuchar_botones():
     url_updates = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     url_answer = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
     
+    # --- PURGA DE CLICS FANTASMAS ---
+    # Leemos la cola de Telegram una vez y la descartamos sin hacer nada
+    try:
+        r = requests.get(url_updates, params={"offset": offset, "timeout": 5}, timeout=10)
+        if r.status_code == 200:
+            updates = r.json().get("result", [])
+            if updates:
+                offset = updates[-1]["update_id"] + 1
+    except:
+        pass
+    
     while True:
         try:
             r = requests.get(url_updates, params={"offset": offset, "timeout": 30}, timeout=40)
@@ -156,11 +166,9 @@ def escuchar_botones():
                         
                         if data == "get_resultados":
                             requests.get(url_answer, params={"callback_query_id": cb_id})
-                            
                             limpiar_chat()
                             
                             if not CACHE_RESULTADOS:
-                                # Este mensaje de aviso temporal sí se borra en la siguiente limpieza
                                 enviar_telegram("⏳ <i>El bot recién inició y está escaneando el ABC. Intentá de nuevo en 1 minuto.</i>", silencioso=True, con_boton=True, es_permanente=False)
                             else:
                                 enviar_telegram("📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>", es_permanente=False)
@@ -190,8 +198,14 @@ def obtener_top_postulantes(session, id_oferta):
                 designado = str(p.get('designado', '')).upper()
                 if estado_post != "ACTIVA" or designado in ["S", "Y"]:
                     continue
-                nombre = html.escape(f"{p.get('apellido', '')} {p.get('nombre', '')}".title().strip())
-                res += f"  {activos_mostrados + 1}º {nombre} | <b>{html.escape(str(p.get('puntaje', '0.00')))} pts</b>\n"
+                
+                # CORRECCIÓN DE NOMBRES
+                apellido = p.get('apellido', '').strip()
+                nombres = p.get('nombres', p.get('nombre', '')).strip()
+                nombre_completo = html.escape(f"{apellido} {nombres}".strip().title())
+                if not nombre_completo: nombre_completo = "Docente"
+                
+                res += f"  {activos_mostrados + 1}º {nombre_completo} | <b>{html.escape(str(p.get('puntaje', '0.00')))} pts</b>\n"
                 activos_mostrados += 1
                 if activos_mostrados >= 3: break
             if activos_mostrados == 0: return "<i>Postulantes inactivos (¡Vía libre!)</i>"
@@ -211,11 +225,10 @@ def monitorear():
         "📚 <b>Cargo:</b> Maestro de Grado\n"
         "⏱ <b>Jornada:</b> Simple y Completa\n"
         "📌 <b>Estado:</b> Ofertas 'Publicadas'\n\n"
-        "🌐 <a href='https://misservicios.abc.gob.ar/actos.publicos.digitales/'>Acceder al portal</a>\n"
+        "🌐 <a href='https://misservicios.abc.gob.ar/actos.publicos.digitales/'>Simular búsqueda visual en el portal</a>\n"
         "<i>(Ingresá manualmente: Gral. Pueyrredón + Maestro de Grado)</i>\n\n"
         "👇 Podés pedir el listado actual tocando el botón de abajo."
     )
-    # APLICAMOS EL ESCUDO: es_permanente=True
     enviar_telegram(msg_arranque, con_boton=True, es_permanente=True)
     
     ofertas_estados_local = {} 
