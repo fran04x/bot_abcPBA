@@ -23,8 +23,9 @@ REQUEST_TIMEOUT = (10, 30)
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-# --- CACHÉ GLOBAL PARA EL BOTÓN ---
+# --- MEMORIA GLOBAL ---
 CACHE_RESULTADOS = []
+MENSAJES_ENVIADOS = set() # Aquí el bot anotará qué mensajes mandó para poder borrarlos luego
 
 try:
     TELEGRAM_MAX_MESSAGE_LEN = int(os.environ.get("TELEGRAM_MAX_MESSAGE_LEN", "4096"))
@@ -41,7 +42,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot Interactivo y Formateado Activo")
+        self.wfile.write(b"Bot Dashboard Activo")
         
     def do_HEAD(self):
         self.send_response(200)
@@ -66,6 +67,7 @@ class TLSAdapter(HTTPAdapter):
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
 def enviar_telegram(mensaje, silencioso=False, con_boton=False):
+    global MENSAJES_ENVIADOS
     if not TOKEN or not CHAT_ID:
         return
 
@@ -80,16 +82,25 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False):
             }
             
         payload_plain = {"chat_id": CHAT_ID, "text": texto, "disable_web_page_preview": True, "disable_notification": silencioso}
+        if con_boton:
+            payload_plain["reply_markup"] = payload["reply_markup"]
 
         try:
             response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
+            data = response.json()
+            if data.get("ok"):
+                MENSAJES_ENVIADOS.add(data["result"]["message_id"]) # Anotamos el ID del mensaje
             return
         except requests.RequestException as error:
             status = getattr(getattr(error, "response", None), "status_code", None)
             if status is not None and 400 <= status < 500:
                 try:
-                    requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT).raise_for_status()
+                    resp_plain = requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
+                    resp_plain.raise_for_status()
+                    data = resp_plain.json()
+                    if data.get("ok"):
+                        MENSAJES_ENVIADOS.add(data["result"]["message_id"])
                     return
                 except:
                     pass
@@ -114,6 +125,17 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False):
     for idx, parte in enumerate(partes, start=1):
         enviar_parte(parte)
 
+def limpiar_chat():
+    """Borra todos los mensajes que el bot tiene registrados en su memoria local."""
+    global MENSAJES_ENVIADOS
+    url_delete = f"https://api.telegram.org/bot{TOKEN}/deleteMessage"
+    for msg_id in list(MENSAJES_ENVIADOS):
+        try:
+            requests.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
+        except:
+            pass
+    MENSAJES_ENVIADOS.clear()
+
 def escuchar_botones():
     global CACHE_RESULTADOS
     offset = 0
@@ -135,15 +157,21 @@ def escuchar_botones():
                         if data == "get_resultados":
                             requests.get(url_answer, params={"callback_query_id": cb_id})
                             
+                            # 1. Limpiamos la pantalla
+                            limpiar_chat()
+                            
+                            # 2. Mostramos los nuevos resultados
                             if not CACHE_RESULTADOS:
-                                enviar_telegram("⏳ <i>El bot recién inició y está escaneando el ABC. Intentá de nuevo en 1 minuto.</i>", silencioso=True)
+                                enviar_telegram("⏳ <i>El bot recién inició y está escaneando el ABC. Intentá de nuevo en 1 minuto.</i>", silencioso=True, con_boton=True)
                             else:
                                 enviar_telegram("📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>")
                                 bloque = ""
                                 for idx, txt in enumerate(CACHE_RESULTADOS, 1):
                                     bloque += txt
                                     if idx % 10 == 0 or idx == len(CACHE_RESULTADOS):
-                                        enviar_telegram(bloque)
+                                        # Agregamos el botón solo al final del último bloque
+                                        poner_boton = (idx == len(CACHE_RESULTADOS))
+                                        enviar_telegram(bloque, con_boton=poner_boton)
                                         bloque = ""
                                         time.sleep(1) 
         except Exception as e:
@@ -178,24 +206,22 @@ def monitorear():
     global CACHE_RESULTADOS
     print("[*] Monitoreo inteligente iniciado...", flush=True)
     
-    # MENSAJE DE ARRANQUE CON DETALLES DE FILTROS Y URLs
-    url_api = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select?q=descdistrito:%22GENERAL%20PUEYRREDON%22%20AND%20estado:%22Publicada%22&rows=1000&wt=json"
+    # MENSAJE DE ARRANQUE LIMPIO Y DIRECTO
     msg_arranque = (
         "✅ <b>SISTEMA INICIADO</b>\n\n"
         "El bot está activo y escaneando el ABC con estos filtros:\n"
         "📍 <b>Distrito:</b> General Pueyrredón\n"
         "📚 <b>Cargo:</b> Maestro de Grado\n"
         "⏱ <b>Jornada:</b> Simple y Completa\n"
-        "📌 <b>Estado:</b> Ofertas 'Publicadas' (alertando 'Designadas' al cerrar)\n\n"
+        "📌 <b>Estado:</b> Ofertas 'Publicadas'\n\n"
         "🌐 <a href='https://misservicios.abc.gob.ar/actos.publicos.digitales/'>Simular búsqueda visual en el portal</a>\n"
         "<i>(Ingresá manualmente: Gral. Pueyrredón + Maestro de Grado)</i>\n\n"
-        f"🤖 <a href='{url_api}'>Ver datos crudos (JSON del sistema)</a>\n\n"
         "👇 Podés pedir el listado actual tocando el botón de abajo."
     )
     enviar_telegram(msg_arranque, con_boton=True)
     
     ofertas_estados_local = {} 
-    HORAS_REPORTE = {6, 9, 14, 17, 20, 21}
+    HORAS_REPORTE = {8, 11, 14, 17, 20}
     ultimo_reporte_enviado = None
     tz_ar = timezone(timedelta(hours=-3))
     
@@ -258,7 +284,6 @@ def monitorear():
                             else:
                                 ofertas_estados_local[id_o] = estado_actual
 
-                        # Traducción y formateo visual
                         escuela = html.escape(str(info.get('escuela', 'N/A')))
                         cargo = html.escape(str(info.get('cargo', 'N/A')))
                         
