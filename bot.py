@@ -5,6 +5,9 @@ import requests
 import urllib3
 import time
 import threading
+import signal
+import sys
+import atexit
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from requests.adapters import HTTPAdapter
@@ -209,6 +212,24 @@ def liberar_lock_instancia(lock_key=INSTANCE_LOCK_KEY):
     owner_actual = upstash_cmd("get", lock_key)
     if owner_actual == INSTANCE_OWNER:
         upstash_cmd("del", lock_key)
+
+# --- MANEJO DE CIERRE SEGURO (GRACEFUL SHUTDOWN) ---
+def limpieza_salida():
+    print("\n[!] Apagando instancia elegantemente. Liberando candados de Upstash...", flush=True)
+    liberar_lock_instancia(MONITOR_LOCK_KEY)
+    liberar_lock_instancia(LISTENER_LOCK_KEY)
+
+# Le decimos a Python que ejecute "limpieza_salida" justo antes de morir
+atexit.register(limpieza_salida)
+
+def manejar_senales(sig, frame):
+    # Al llamar a sys.exit(0), forzamos a que salte el 'atexit' de arriba
+    sys.exit(0)
+
+# Atrapamos la orden de asesinato de Render (SIGTERM)
+signal.signal(signal.SIGTERM, manejar_senales)
+# Atrapamos el cierre manual por consola (Control+C)
+signal.signal(signal.SIGINT, manejar_senales)
 
 def callback_ya_procesado(callback_id, ttl_seg=300, max_items=2000):
     base_url, _ = _upstash_headers()
