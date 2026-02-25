@@ -540,6 +540,7 @@ def obtener_top_postulantes(session, id_oferta):
     params = {"q": f"idoferta:{id_oferta}", "sort": "puntaje desc", "rows": "10", "wt": "json"}
     try:
         r = session.get(url_p, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
+        r.encoding = 'utf-8'
         if r.status_code == 200:
             docs = r.json().get("response", {}).get("docs", [])
             if not docs: return "<i>Sin postulantes aún</i>\n"
@@ -551,17 +552,17 @@ def obtener_top_postulantes(session, id_oferta):
                 if estado_post != "ACTIVA" or designado in ["S", "Y"]:
                     continue
                 
-                apellido = str(p.get('apellido', '')).strip()
-                nombres = str(p.get('nombres', p.get('nombre', ''))).strip()
-                nombre_crudo = f"{apellido} {nombres}".strip()
+                apellido = str(p.get('apellido', '')).strip().title()
+                nombres = str(p.get('nombres', p.get('nombre', ''))).strip().title()
                 
-                if not nombre_crudo:
-                    nombre_crudo = str(p.get('apellidoynombre', '')).strip()
-                    
-                if not nombre_crudo:
-                    nombre_crudo = "Docente"
-                    
-                nombre_completo = html.escape(nombre_crudo.title())
+                if apellido or nombres:
+                    primer_nombre = nombres.split()[0] if nombres else ""
+                    inicial = f"{primer_nombre[0]}." if primer_nombre else ""
+                    nombre_final = f"{inicial} {apellido}".strip()
+                else:
+                    nombre_final = str(p.get('apellidoynombre', 'Docente')).strip().title()
+
+                nombre_completo = html.escape(nombre_final)
                 puntaje = html.escape(str(p.get('puntaje', '0.00')))
                 
                 res += f"  {activos_mostrados + 1}º {nombre_completo} | <b>{puntaje} pts</b>\n"
@@ -626,14 +627,13 @@ def monitorear():
             "✅ <b>INICIADO CORRECTAMENTE</b>\n\n"
             "El sistema está activo y escaneando el ABC con estos filtros:\n"
             "📍 <b>Distrito:</b> General Pueyrredón\n"
-            "📚 <b>Cargo:</b> Maestro de Grado (/MG)\n"
-            "⏱ <b>Jornada:</b> Simple y Completa\n"
+            "📚 <b>Cargo:</b> Maestro de Grado (MG)\n"
             "📌 <b>Estado:</b> Ofertas 'Publicadas'\n\n"
             "🌐 <a href='https://misservicios.abc.gob.ar/actos.publicos.digitales/'>Ingresar a la página principal del portal</a>\n"
             "👇 Podés pedir el listado actual tocando el botón de abajo."
         )
         
-        # --- NUEVA LÓGICA: BORRAR EL SALUDO ANTERIOR ---
+        # --- BORRAR EL SALUDO ANTERIOR ---
         base_url, headers = _upstash_headers()
         if base_url:
             try:
@@ -647,7 +647,7 @@ def monitorear():
                 pass
 
         # Enviamos el nuevo saludo inmortal
-        sent_ids = enviar_telegram(msg_arranque, con_boton=True, es_permanente=True)
+        sent_ids = enviar_telegram(msg_arranque, silencioso=True, con_boton=True, es_permanente=True)
         
         # Guardamos el ID de este nuevo saludo en Upstash para borrarlo en el próximo reinicio
         if base_url and sent_ids:
@@ -687,10 +687,11 @@ def monitorear():
                         # 1. Agregamos el sort en la API para que no nos oculte las ofertas nuevas
                         params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND (estado:"Publicada" OR estado:"Designada")', "rows": "1000", "wt": "json", "sort": "idoferta desc"}
                         r = session.get(url_solr, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
+                        r.encoding = 'utf-8'
 
                         if r.status_code == 200:
                             docs = r.json().get("response", {}).get("docs", [])
-                            hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo", "")).upper()]
+                            hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo", "")).upper() and "MG5" not in str(o.get("cargo", "")).upper()]
                             
                             # 2. Ordenamos internamente por fecha de inicio (De más antigua a más nueva)
                             def extraer_timestamp(valor):
@@ -763,7 +764,13 @@ def monitorear():
                                 curso = html.escape(str(info.get('curso', '-')))
                                 division = html.escape(str(info.get('division', '-')))
                                 direccion = html.escape(str(info.get('domiciliodesempeno', info.get('domicilio', 'N/A'))).strip())
-                                revista = html.escape(str(info.get('supl_revista', 'N/A')))
+                                revista_raw = str(info.get('supl_revista', '')).upper()
+                                if revista_raw == 'S':
+                                    revista = "Suplencia"
+                                elif revista_raw == 'P':
+                                    revista = "Provisionalidad"
+                                else:
+                                    revista = html.escape(revista_raw) if revista_raw else "N/A"
                                 cierre_oferta = html.escape(formatear_fecha_argentina(info.get('finoferta'), tz_ar))
                                 desde = html.escape(formatear_fecha_argentina(info.get('supl_desde'), tz_ar))
                                 hasta = html.escape(formatear_fecha_argentina(info.get('supl_hasta'), tz_ar))
@@ -785,14 +792,14 @@ def monitorear():
                                     txt = f"🏫 <b>Escuela:</b> <code>{escuela}</code>\n"
                                     if direccion not in ("N/A", "-", ""):
                                         txt += f"📍 <b>Dirección:</b> {direccion}\n"
-                                    txt += f"📚 <b>Área:</b> {cargo}\n"
                                     txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
                                     txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
                                     if curso != "-" or division != "-":
                                         txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                                     txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                                     txt += f"📝 <b>Revista:</b> {revista}\n"
-                                    txt += f"📅 <b>Período:</b> {desde} al {hasta}\n"
+                                    txt += f"🟢 <b>Desde:</b> {desde}\n"
+                                    txt += f"🔴 <b>Hasta:</b> {hasta}\n"
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
                                     txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
                                     txt += "───────────────────\n"
@@ -806,14 +813,14 @@ def monitorear():
                                     txt = f"🏫 <b>Escuela:</b> {escuela}\n"
                                     if direccion not in ("N/A", "-", ""):
                                         txt += f"📍 <b>Dirección:</b> {direccion}\n"
-                                    txt += f"📚 <b>Área:</b> {cargo}\n"
                                     txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
                                     txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
                                     if curso != "-" or division != "-":
                                         txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                                     txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                                     txt += f"📝 <b>Revista:</b> {revista}\n"
-                                    txt += f"📅 <b>Período:</b> {desde} al {hasta}\n"
+                                    txt += f"🟢 <b>Desde:</b> {desde}\n"
+                                    txt += f"🔴 <b>Hasta:</b> {hasta}\n"
                                     txt += "───────────────────\n"
                                     buffer_cerradas.append((id_o, txt))
 
@@ -827,13 +834,14 @@ def monitorear():
                                     enviar_ofertas_sin_cortes(
                                         temp_cache,
                                         encabezado=f"📊 <b>LISTADO DE CARGOS ({len(temp_cache)} resultados):</b>",
+                                        silencioso=True,
                                         es_permanente=False,
                                         repetir_encabezado=False,
                                         pausa_segundos=1,
                                         con_boton_al_final=True
                                     )
                                 else:
-                                    enviar_telegram("📭 No hay cargos activos en este momento.", es_permanente=False, con_boton=True)
+                                    enviar_telegram("📭 No hay cargos activos en este momento.", silencioso=True, es_permanente=False, con_boton=True)
 
                             ahora = datetime.now(tz_ar)
                             hora_actual = ahora.hour
