@@ -89,7 +89,6 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
             response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            # Si NO es permanente, lo anotamos para poder borrarlo en la próxima actualización
             if data.get("ok") and not es_permanente:
                 MENSAJES_ENVIADOS.add(data["result"]["message_id"])
             return
@@ -143,7 +142,6 @@ def escuchar_botones():
     url_answer = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
     ultimo_clic = 0
     
-    # PURGA INICIAL: Borra clics viejos de Telegram que hayan quedado colgados mientras el bot reiniciaba
     try:
         r = requests.get(url_updates, params={"offset": offset, "timeout": 5}, timeout=10)
         if r.status_code == 200:
@@ -167,7 +165,6 @@ def escuchar_botones():
                         
                         if data == "get_resultados":
                             ahora = time.time()
-                            # ESCUDO ANTI-SPAM: Ignora clics que ocurran con menos de 3 segundos de diferencia
                             if ahora - ultimo_clic < 3:
                                 requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Cargando...", "show_alert": False})
                                 continue
@@ -208,7 +205,6 @@ def obtener_top_postulantes(session, id_oferta):
                 if estado_post != "ACTIVA" or designado in ["S", "Y"]:
                     continue
                 
-                # --- CORRECCIÓN SÚPER ROBUSTA DE NOMBRES ---
                 apellido = str(p.get('apellido', '')).strip()
                 nombres = str(p.get('nombres', p.get('nombre', ''))).strip()
                 nombre_crudo = f"{apellido} {nombres}".strip()
@@ -218,7 +214,6 @@ def obtener_top_postulantes(session, id_oferta):
                     
                 if not nombre_crudo:
                     nombre_crudo = "Docente"
-                # --------------------------------------------
                     
                 nombre_completo = html.escape(nombre_crudo.title())
                 puntaje = html.escape(str(p.get('puntaje', '0.00')))
@@ -248,7 +243,6 @@ def monitorear():
         "<i>(Ingresá manualmente: Gral. Pueyrredón + Maestro de Grado)</i>\n\n"
         "👇 Podés pedir el listado actual tocando el botón de abajo."
     )
-    # ESCUDO ACTIVADO: Este mensaje nunca se borra
     enviar_telegram(msg_arranque, con_boton=True, es_permanente=True)
     
     ofertas_estados_local = {} 
@@ -279,8 +273,17 @@ def monitorear():
                     hallazgos = [o for o in docs if "MAESTRO DE GRADO" in str(o.get("cargo","")).upper()]
                     ts = int(time.time() * 1000)
 
+                    # --- ESCUDO ANTI-CLONES ---
+                    procesados_en_vuelta = set()
+
                     for info in hallazgos:
                         id_o = str(info.get('idoferta'))
+                        
+                        # Si ya procesamos este ID en este mismo ciclo de búsqueda, lo saltamos
+                        if id_o in procesados_en_vuelta:
+                            continue
+                        procesados_en_vuelta.add(id_o)
+
                         estado_actual = str(info.get('estado', '')).upper()
                         estado_previo = None
 
@@ -318,6 +321,10 @@ def monitorear():
                         escuela = html.escape(str(info.get('escuela', 'N/A')))
                         cargo = html.escape(str(info.get('cargo', 'N/A')))
                         
+                        # --- VOLVEMOS A EXTRAER CURSO Y DIVISIÓN ---
+                        curso = html.escape(str(info.get('curso', '-')))
+                        division = html.escape(str(info.get('division', '-')))
+                        
                         jornada_raw = str(info.get('jornada', '')).upper()
                         if "JC" in jornada_raw:
                             jornada_texto = "Completa"
@@ -331,7 +338,13 @@ def monitorear():
                             link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                             
                             txt = f"🏫 <b>Escuela:</b> {escuela}\n"
+                            txt += f"📋 <b>ID Oferta:</b> <code>{id_o}</code>\n"
                             txt += f"📚 <b>Área:</b> <code>{cargo}</code>\n"
+                            
+                            # Mostrar Curso/División solo si hay datos útiles
+                            if curso != "-" or division != "-":
+                                txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
+                                
                             txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                             txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
                             txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
@@ -344,7 +357,10 @@ def monitorear():
 
                         elif cambio_a_designada:
                             txt = f"🏫 <b>Escuela:</b> {escuela}\n"
+                            txt += f"📋 <b>ID Oferta:</b> <code>{id_o}</code>\n"
                             txt += f"📚 <b>Área:</b> <code>{cargo}</code>\n"
+                            if curso != "-" or division != "-":
+                                txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                             txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                             txt += "───────────────────\n"
                             buffer_cerradas.append(txt)
