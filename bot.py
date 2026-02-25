@@ -33,7 +33,16 @@ ULTIMA_CARGA_OK_TS = 0
 CACHE_LOCK = threading.Lock()
 CALLBACKS_PROCESADOS = {}
 INSTANCE_LOCK_KEY = os.environ.get("INSTANCE_LOCK_KEY", "abcbot_instance_lock")
+LISTENER_LOCK_KEY = os.environ.get("LISTENER_LOCK_KEY", f"{INSTANCE_LOCK_KEY}:listener")
+MONITOR_LOCK_KEY = os.environ.get("MONITOR_LOCK_KEY", f"{INSTANCE_LOCK_KEY}:monitor")
 INSTANCE_OWNER = f"{os.environ.get('HOSTNAME', 'local')}-{os.getpid()}-{int(time.time())}"
+
+try:
+    LOCK_TTL_SEG = int(os.environ.get("INSTANCE_LOCK_TTL_SECONDS", "1800"))
+    if LOCK_TTL_SEG < 300:
+        LOCK_TTL_SEG = 300
+except ValueError:
+    LOCK_TTL_SEG = 1800
 
 try:
     TELEGRAM_MAX_MESSAGE_LEN = int(os.environ.get("TELEGRAM_MAX_MESSAGE_LEN", "4096"))
@@ -160,40 +169,47 @@ def upstash_cmd(*parts, timeout=5):
         pass
     return None
 
-def adquirir_lock_instancia(ttl_seg=180):
+def adquirir_lock_instancia(ttl_seg=LOCK_TTL_SEG, lock_key=INSTANCE_LOCK_KEY):
     base_url, _ = _upstash_headers()
     if not base_url:
         return True
 
-    result = upstash_cmd("set", INSTANCE_LOCK_KEY, INSTANCE_OWNER, "EX", ttl_seg, "NX")
+    result = upstash_cmd("set", lock_key, INSTANCE_OWNER, "EX", ttl_seg, "NX")
     if str(result).upper() == "OK":
         return True
 
-    owner_actual = upstash_cmd("get", INSTANCE_LOCK_KEY)
+    owner_actual = upstash_cmd("get", lock_key)
     return owner_actual == INSTANCE_OWNER
 
-def renovar_lock_instancia(ttl_seg=180):
+def renovar_lock_instancia(ttl_seg=LOCK_TTL_SEG, lock_key=INSTANCE_LOCK_KEY):
     base_url, _ = _upstash_headers()
     if not base_url:
         return True
 
-    owner_actual = upstash_cmd("get", INSTANCE_LOCK_KEY)
+    owner_actual = upstash_cmd("get", lock_key)
     if owner_actual != INSTANCE_OWNER:
         return False
 
-    result = upstash_cmd("set", INSTANCE_LOCK_KEY, INSTANCE_OWNER, "EX", ttl_seg, "XX")
+    result = upstash_cmd("set", lock_key, INSTANCE_OWNER, "EX", ttl_seg, "XX")
     return str(result).upper() == "OK"
 
-def liberar_lock_instancia():
+def liberar_lock_instancia(lock_key=INSTANCE_LOCK_KEY):
     base_url, _ = _upstash_headers()
     if not base_url:
         return
 
-    owner_actual = upstash_cmd("get", INSTANCE_LOCK_KEY)
+    owner_actual = upstash_cmd("get", lock_key)
     if owner_actual == INSTANCE_OWNER:
-        upstash_cmd("del", INSTANCE_LOCK_KEY)
+        upstash_cmd("del", lock_key)
 
 def callback_ya_procesado(callback_id, ttl_seg=300, max_items=2000):
+    base_url, _ = _upstash_headers()
+    if base_url:
+        clave = f"cb_seen_{callback_id}"
+        result = upstash_cmd("set", clave, INSTANCE_OWNER, "EX", ttl_seg, "NX")
+        if str(result).upper() != "OK":
+            return True
+
     ahora = time.time()
     expirar = ahora - ttl_seg
 
@@ -371,6 +387,10 @@ def limpiar_chat():
 
 def escuchar_botones():
     global CACHE_RESULTADOS, ULTIMO_AVISO_NO_LISTO_TS, ULTIMA_CARGA_OK_TS
+    if not adquirir_lock_instancia(LOCK_TTL_SEG, LISTENER_LOCK_KEY):
+        print("[!] Listener pasivo: lock tomado por otra instancia.", flush=True)
+        return
+
     offset = 0
     url_updates = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     url_answer = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
@@ -391,78 +411,85 @@ def escuchar_botones():
     except:
         pass
     
-    while True:
-        try:
-            r = requests.get(url_updates, params={"offset": offset, "timeout": 30}, timeout=40)
-            if r.status_code == 200:
-                updates = r.json().get("result", [])
-                for up in updates:
-                    offset = up["update_id"] + 1
-                    if "callback_query" in up:
-                        cb = up["callback_query"]
-                        cb_id = cb["id"]
-                        data = cb.get("data")
+    try:
+        while True:
+            if not renovar_lock_instancia(LOCK_TTL_SEG, LISTENER_LOCK_KEY):
+                print("[!] Listener detiene: lock perdido.", flush=True)
+                return
 
-                        if callback_ya_procesado(cb_id):
-                            requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Ya procesado", "show_alert": False}, timeout=REQUEST_TIMEOUT)
-                            continue
-                        
-                        if data == "get_resultados":
-                            ahora = time.time()
-                            if ahora - ultimo_clic < 3:
-                                requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Cargando...", "show_alert": False}, timeout=REQUEST_TIMEOUT)
+            try:
+                r = requests.get(url_updates, params={"offset": offset, "timeout": 30}, timeout=40)
+                if r.status_code == 200:
+                    updates = r.json().get("result", [])
+                    for up in updates:
+                        offset = up["update_id"] + 1
+                        if "callback_query" in up:
+                            cb = up["callback_query"]
+                            cb_id = cb["id"]
+                            data = cb.get("data")
+
+                            if callback_ya_procesado(cb_id):
+                                requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Ya procesado", "show_alert": False}, timeout=REQUEST_TIMEOUT)
                                 continue
                             
-                            ultimo_clic = ahora
-                            if (ahora - INICIO_BOT_TS) < 60 or ULTIMA_CARGA_OK_TS == 0:
-                                requests.get(
-                                    url_answer,
-                                    params={
-                                        "callback_query_id": cb_id,
-                                        "text": "⏳ El bot recién inició. Esperá 1 minuto e intentá de nuevo.",
-                                        "show_alert": False
-                                    },
-                                    timeout=REQUEST_TIMEOUT
-                                )
-                                if (ahora - ULTIMO_AVISO_NO_LISTO_TS) >= 60:
-                                    enviar_telegram(
-                                        "⏳ <i>El bot recién inició o aún no terminó de cargar datos. Esperá 1 minuto e intentá de nuevo.</i>",
-                                        silencioso=True,
-                                        es_permanente=False
+                            if data == "get_resultados":
+                                ahora = time.time()
+                                if ahora - ultimo_clic < 3:
+                                    requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Cargando...", "show_alert": False}, timeout=REQUEST_TIMEOUT)
+                                    continue
+                                
+                                ultimo_clic = ahora
+                                if (ahora - INICIO_BOT_TS) < 60 or ULTIMA_CARGA_OK_TS == 0:
+                                    requests.get(
+                                        url_answer,
+                                        params={
+                                            "callback_query_id": cb_id,
+                                            "text": "⏳ El bot recién inició. Esperá 1 minuto e intentá de nuevo.",
+                                            "show_alert": False
+                                        },
+                                        timeout=REQUEST_TIMEOUT
                                     )
-                                    ULTIMO_AVISO_NO_LISTO_TS = ahora
-                                continue
+                                    if (ahora - ULTIMO_AVISO_NO_LISTO_TS) >= 60:
+                                        enviar_telegram(
+                                            "⏳ <i>El bot recién inició o aún no terminó de cargar datos. Esperá 1 minuto e intentá de nuevo.</i>",
+                                            silencioso=True,
+                                            es_permanente=False
+                                        )
+                                        ULTIMO_AVISO_NO_LISTO_TS = ahora
+                                    continue
 
-                            with CACHE_LOCK:
-                                cache_snapshot = list(CACHE_RESULTADOS)
+                                with CACHE_LOCK:
+                                    cache_snapshot = list(CACHE_RESULTADOS)
 
-                            if not cache_snapshot:
-                                requests.get(
-                                    url_answer,
-                                    params={
-                                        "callback_query_id": cb_id,
-                                        "text": "📭 No hay cargos activos en este momento.",
-                                        "show_alert": False
-                                    },
-                                    timeout=REQUEST_TIMEOUT
+                                if not cache_snapshot:
+                                    requests.get(
+                                        url_answer,
+                                        params={
+                                            "callback_query_id": cb_id,
+                                            "text": "📭 No hay cargos activos en este momento.",
+                                            "show_alert": False
+                                        },
+                                        timeout=REQUEST_TIMEOUT
+                                    )
+                                    continue
+
+                                requests.get(url_answer, params={"callback_query_id": cb_id}, timeout=REQUEST_TIMEOUT)
+
+                                limpiar_chat()
+                                enviar_ofertas_sin_cortes(
+                                    cache_snapshot,
+                                    encabezado="📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>",
+                                    es_permanente=False,
+                                    repetir_encabezado=False,
+                                    pausa_segundos=1
                                 )
-                                continue
-
-                            requests.get(url_answer, params={"callback_query_id": cb_id}, timeout=REQUEST_TIMEOUT)
-
-                            limpiar_chat()
-                            enviar_ofertas_sin_cortes(
-                                cache_snapshot,
-                                encabezado="📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>",
-                                es_permanente=False,
-                                repetir_encabezado=False,
-                                pausa_segundos=1
-                            )
-            else:
-                print(f"[!] getUpdates devolvió {r.status_code}: {r.text}", flush=True)
-        except Exception as e:
-            print(f"[-] Error en escuchar_botones: {e}", flush=True)
-            time.sleep(5)
+                else:
+                    print(f"[!] getUpdates devolvió {r.status_code}: {r.text}", flush=True)
+            except Exception as e:
+                print(f"[-] Error en escuchar_botones: {e}", flush=True)
+                time.sleep(5)
+    finally:
+        liberar_lock_instancia(LISTENER_LOCK_KEY)
 
 def obtener_top_postulantes(session, id_oferta):
     url_p = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.postulante/select"
@@ -541,7 +568,7 @@ def formatear_fecha_argentina(valor, tz_obj):
 
 def monitorear():
     global CACHE_RESULTADOS, ULTIMA_CARGA_OK_TS
-    if not adquirir_lock_instancia():
+    if not adquirir_lock_instancia(LOCK_TTL_SEG, MONITOR_LOCK_KEY):
         print("[!] Otra instancia ya está monitoreando. Esta instancia queda en modo pasivo.", flush=True)
         return
 
@@ -567,7 +594,7 @@ def monitorear():
 
     try:
         while True:
-            if not renovar_lock_instancia():
+            if not renovar_lock_instancia(LOCK_TTL_SEG, MONITOR_LOCK_KEY):
                 print("[!] Se perdió el lock de instancia. Se detiene monitoreo para evitar duplicados.", flush=True)
                 return
 
@@ -725,7 +752,7 @@ def monitorear():
 
             time.sleep(900)
     finally:
-        liberar_lock_instancia()
+        liberar_lock_instancia(MONITOR_LOCK_KEY)
 
 if __name__ == "__main__":
     web_thread = threading.Thread(target=run_web_server, daemon=True)
