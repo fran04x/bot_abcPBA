@@ -26,6 +26,7 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 # --- MEMORIA GLOBAL ---
 CACHE_RESULTADOS = []
 MENSAJES_ENVIADOS = set()
+MENSAJE_POR_OFERTA = {}
 INICIO_BOT_TS = time.time()
 ULTIMO_AVISO_NO_LISTO_TS = 0
 
@@ -71,11 +72,13 @@ class TLSAdapter(HTTPAdapter):
 def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=False):
     global MENSAJES_ENVIADOS
     if not TOKEN or not CHAT_ID:
-        return
+        return []
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    sent_ids = []
     
     def enviar_parte(texto):
+        nonlocal sent_ids
         payload = {"chat_id": CHAT_ID, "text": texto, "parse_mode": "HTML", "disable_web_page_preview": True, "disable_notification": silencioso}
         
         if con_boton:
@@ -91,8 +94,11 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
             response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            if data.get("ok") and not es_permanente:
-                MENSAJES_ENVIADOS.add(data["result"]["message_id"])
+            if data.get("ok"):
+                message_id = data["result"]["message_id"]
+                sent_ids.append(message_id)
+                if not es_permanente:
+                    MENSAJES_ENVIADOS.add(message_id)
             return
         except requests.RequestException as error:
             status = getattr(getattr(error, "response", None), "status_code", None)
@@ -101,8 +107,11 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
                     resp_plain = requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
                     resp_plain.raise_for_status()
                     data = resp_plain.json()
-                    if data.get("ok") and not es_permanente:
-                        MENSAJES_ENVIADOS.add(data["result"]["message_id"])
+                    if data.get("ok"):
+                        message_id = data["result"]["message_id"]
+                        sent_ids.append(message_id)
+                        if not es_permanente:
+                            MENSAJES_ENVIADOS.add(message_id)
                     return
                 except:
                     pass
@@ -111,7 +120,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
     max_len = TELEGRAM_MAX_MESSAGE_LEN
     if len(mensaje) <= max_len:
         enviar_parte(mensaje)
-        return
+        return sent_ids
 
     partes = []
     bloque = ""
@@ -126,6 +135,83 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
 
     for idx, parte in enumerate(partes, start=1):
         enviar_parte(parte)
+    return sent_ids
+
+def _upstash_headers():
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        return UPSTASH_URL.rstrip('/'), {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+    return None, None
+
+def guardar_mensaje_oferta(id_oferta, message_id):
+    MENSAJE_POR_OFERTA[str(id_oferta)] = int(message_id)
+    base_url, headers = _upstash_headers()
+    if not base_url:
+        return
+    try:
+        requests.get(f"{base_url}/set/oferta_msg_{id_oferta}/{int(message_id)}", headers=headers, timeout=5)
+    except Exception:
+        pass
+
+def obtener_mensaje_oferta(id_oferta):
+    clave = str(id_oferta)
+    if clave in MENSAJE_POR_OFERTA:
+        return MENSAJE_POR_OFERTA[clave]
+
+    base_url, headers = _upstash_headers()
+    if not base_url:
+        return None
+
+    try:
+        resp = requests.get(f"{base_url}/get/oferta_msg_{id_oferta}", headers=headers, timeout=5)
+        if resp.status_code == 200:
+            result = resp.json().get("result")
+            if result not in (None, ""):
+                MENSAJE_POR_OFERTA[clave] = int(result)
+                return MENSAJE_POR_OFERTA[clave]
+    except Exception:
+        pass
+    return None
+
+def eliminar_mensaje_oferta(id_oferta):
+    MENSAJE_POR_OFERTA.pop(str(id_oferta), None)
+    base_url, headers = _upstash_headers()
+    if not base_url:
+        return
+    try:
+        requests.get(f"{base_url}/del/oferta_msg_{id_oferta}", headers=headers, timeout=5)
+    except Exception:
+        pass
+
+def editar_mensaje_telegram(message_id, texto):
+    if not TOKEN or not CHAT_ID:
+        return False
+
+    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+    payload = {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": texto,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    payload_plain = {
+        "chat_id": CHAT_ID,
+        "message_id": message_id,
+        "text": texto,
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True
+        if 400 <= r.status_code < 500:
+            r2 = requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
+            return r2.status_code == 200 and r2.json().get("ok")
+    except Exception:
+        return False
+    return False
 
 def enviar_ofertas_sin_cortes(
     ofertas,
@@ -382,7 +468,7 @@ def monitorear():
     enviar_telegram(msg_arranque, con_boton=True, es_permanente=True)
     
     ofertas_estados_local = {} 
-    HORAS_REPORTE = {6, 9, 14, 17, 20, 21}
+    HORAS_REPORTE = {6, 9, 12, 15, 18, 20}
     ultimo_reporte_enviado = None
     tz_ar = timezone(timedelta(hours=-3))
     
@@ -508,7 +594,7 @@ def monitorear():
                             temp_cache.append(txt)
                             
                             if es_nueva_y_publicada:
-                                buffer_nuevas.append(txt)
+                                buffer_nuevas.append((id_o, txt))
 
                         elif cambio_a_designada:
                             txt = f"🏫 <b>Escuela:</b> {escuela}\n"
@@ -518,7 +604,7 @@ def monitorear():
                                 txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                             txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
                             txt += "───────────────────\n"
-                            buffer_cerradas.append(txt)
+                            buffer_cerradas.append((id_o, txt))
 
                     CACHE_RESULTADOS = temp_cache
 
@@ -527,23 +613,26 @@ def monitorear():
                     hora_str = ahora.strftime("%H:%M")
 
                     if buffer_nuevas:
-                        enviar_ofertas_sin_cortes(
-                            buffer_nuevas,
-                            encabezado=f"🚨 <b>NUEVOS CARGOS ({hora_str} hs)</b> 🚨",
-                            es_permanente=False,
-                            repetir_encabezado=True,
-                            pausa_segundos=2
-                        )
+                        for id_o, txt in buffer_nuevas:
+                            mensaje_nuevo = f"🚨 <b>NUEVO CARGO ({hora_str} hs)</b> 🚨\n\n{txt}"
+                            sent_ids = enviar_telegram(mensaje_nuevo, es_permanente=False)
+                            if sent_ids:
+                                guardar_mensaje_oferta(id_o, sent_ids[0])
+                            time.sleep(2)
                                 
                     if buffer_cerradas:
-                        enviar_ofertas_sin_cortes(
-                            buffer_cerradas,
-                            encabezado="❌ <b>CARGOS DESIGNADOS (Cerrados)</b> ❌",
-                            silencioso=True,
-                            es_permanente=False,
-                            repetir_encabezado=True,
-                            pausa_segundos=2
-                        )
+                        for id_o, txt in buffer_cerradas:
+                            mensaje_designada = f"❌ <b>CARGO DESIGNADO ({hora_str} hs)</b> ❌\n\n{txt}"
+                            message_id = obtener_mensaje_oferta(id_o)
+                            editado = False
+                            if message_id is not None:
+                                editado = editar_mensaje_telegram(message_id, mensaje_designada)
+
+                            if not editado:
+                                enviar_telegram(mensaje_designada, silencioso=True, es_permanente=False)
+
+                            eliminar_mensaje_oferta(id_o)
+                            time.sleep(2)
                     
                     if (buffer_nuevas or buffer_cerradas) and hora_actual in HORAS_REPORTE:
                         ultimo_reporte_enviado = hora_actual
