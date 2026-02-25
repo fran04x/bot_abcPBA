@@ -39,6 +39,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot Activo")
+        
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -167,10 +171,13 @@ def obtener_top_postulantes(session, id_oferta):
     return "<i>Sin datos</i>"
 
 def monitorear():
-    print("[*] Monitoreo silencioso iniciado con base de datos Upstash...", flush=True)
+    print("[*] Monitoreo silencioso en tiempo real iniciado con Upstash...", flush=True)
     ofertas_avisadas_local = set() # Backup local por si falla internet
     buffer_ofertas = []
-    ultimo_turno_enviado = None
+    
+    # Variables para el control de los mensajes de "prueba de vida"
+    HORAS_REPORTE = {6, 9, 14, 17, 20, 21}
+    ultimo_reporte_enviado = None
 
     tz_ar = timezone(timedelta(hours=-3))
     
@@ -203,23 +210,19 @@ def monitorear():
                         # LÓGICA DE MEMORIA EN LA NUBE CON UPSTASH
                         if UPSTASH_URL and UPSTASH_TOKEN:
                             base_url = UPSTASH_URL.rstrip('/')
-                            # Usamos el comando SADD (Set Add) de Redis vía REST
                             url_redis = f"{base_url}/sadd/ofertas_enviadas/{id_o}"
                             headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
                             try:
                                 resp = requests.get(url_redis, headers=headers, timeout=5)
                                 if resp.status_code == 200:
-                                    # La API devuelve 1 si se agregó (es nuevo), o 0 si ya estaba
                                     if resp.json().get("result") == 1:
                                         es_nueva = True
                             except Exception as e:
                                 print(f"[-] Error conectando a Redis, usando RAM local: {e}", flush=True)
-                                # Fallback local
                                 if id_o not in ofertas_avisadas_local:
                                     ofertas_avisadas_local.add(id_o)
                                     es_nueva = True
                         else:
-                            # Fallback si no pusiste las variables en Render
                             if id_o not in ofertas_avisadas_local:
                                 ofertas_avisadas_local.add(id_o)
                                 es_nueva = True
@@ -241,41 +244,45 @@ def monitorear():
 
                     ahora = datetime.now(tz_ar)
                     hora_actual = ahora.hour
+                    hora_str = ahora.strftime("%H:%M")
 
-                    es_hora_de_envio = (hora_actual == 9 and ultimo_turno_enviado != 9) or (hora_actual == 21 and ultimo_turno_enviado != 21)
-
-                    if es_hora_de_envio:
-                        hora_str = ahora.strftime("%H:%M")
-                        
-                        if not buffer_ofertas:
-                            enviar_telegram(f"⏳ <i>{hora_str} hs - Información actualizada: Sin cargos nuevos.</i>", silencioso=True)
-                        else:
-                            bloque = ""
-                            contador = 0
-                            for txt in buffer_ofertas:
-                                bloque += txt
-                                contador += 1
-                                if contador >= 15:
-                                    enviar_telegram(f"🚨 <b>RESUMEN DE CARGOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
-                                    bloque = ""
-                                    contador = 0
-                                    time.sleep(2)
-                                    
-                            if bloque:
-                                enviar_telegram(f"🚨 <b>RESUMEN DE CARGOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
+                    # CASO 1: HAY OFERTAS NUEVAS (Se envían INMEDIATAMENTE)
+                    if buffer_ofertas:
+                        bloque = ""
+                        contador = 0
+                        for txt in buffer_ofertas:
+                            bloque += txt
+                            contador += 1
+                            if contador >= 15:
+                                enviar_telegram(f"🚨 <b>NUEVOS CARGOS ENCONTRADOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
+                                bloque = ""
+                                contador = 0
+                                time.sleep(2)
+                                
+                        if bloque:
+                            enviar_telegram(f"🚨 <b>NUEVOS CARGOS ENCONTRADOS ({hora_str} hs)</b> 🚨\n\n{bloque}")
 
                         buffer_ofertas.clear()
+                        
+                        # Si justo enviamos una alerta en una hora de reporte, contamos el reporte como cumplido
+                        if hora_actual in HORAS_REPORTE:
+                            ultimo_reporte_enviado = hora_actual
 
-                    ultimo_turno_enviado = hora_actual
+                    # CASO 2: NO HAY OFERTAS NUEVAS, PERO ES HORA DE REPORTE DE SALUD
+                    elif hora_actual in HORAS_REPORTE and ultimo_reporte_enviado != hora_actual:
+                        enviar_telegram(f"⏳ <i>{hora_str} hs - Bot activo: Monitoreando sin encontrar cargos nuevos por el momento.</i>", silencioso=True)
+                        ultimo_reporte_enviado = hora_actual
+
                 else:
                     print(f"[!] Consulta de ofertas devolvió estado {r.status_code}", flush=True)
 
-            print(f"[*] Revisión oculta finalizada. Ofertas en espera: {len(buffer_ofertas)}", flush=True)
+            print(f"[*] Revisión finalizada ({ahora.strftime('%H:%M')}).", flush=True)
         except requests.RequestException as error:
             print(f"[-] Error de red: {error}", flush=True)
         except Exception as e:
             print(f"[-] Error: {e}", flush=True)
         
+        # Sigue durmiendo 15 minutos exactos entre cada chequeo
         time.sleep(900)
 
 if __name__ == "__main__":
