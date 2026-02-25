@@ -27,6 +27,7 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 CACHE_RESULTADOS = []
 MENSAJES_ENVIADOS = set()
 INICIO_BOT_TS = time.time()
+ULTIMO_AVISO_NO_LISTO_TS = 0
 
 try:
     TELEGRAM_MAX_MESSAGE_LEN = int(os.environ.get("TELEGRAM_MAX_MESSAGE_LEN", "4096"))
@@ -126,6 +127,82 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
     for idx, parte in enumerate(partes, start=1):
         enviar_parte(parte)
 
+def enviar_ofertas_sin_cortes(
+    ofertas,
+    encabezado=None,
+    silencioso=False,
+    es_permanente=False,
+    repetir_encabezado=False,
+    pausa_segundos=1
+):
+    if not ofertas:
+        if encabezado:
+            enviar_telegram(encabezado, silencioso=silencioso, es_permanente=es_permanente)
+        return
+
+    max_len = TELEGRAM_MAX_MESSAGE_LEN
+    prefijo = f"{encabezado}\n\n" if encabezado else ""
+
+    mensaje_actual = ""
+    envio_numero = 0
+
+    def prefijo_para_nuevo_mensaje():
+        if not prefijo:
+            return ""
+        if repetir_encabezado:
+            return prefijo
+        return prefijo if envio_numero == 0 else ""
+
+    for oferta in ofertas:
+        texto_oferta = str(oferta)
+        inicio = prefijo_para_nuevo_mensaje()
+
+        if not mensaje_actual:
+            candidato = f"{inicio}{texto_oferta}"
+            if len(candidato) <= max_len:
+                mensaje_actual = candidato
+                continue
+
+            if inicio and len(inicio.strip()) <= max_len:
+                enviar_telegram(inicio.strip(), silencioso=silencioso, es_permanente=es_permanente)
+                envio_numero += 1
+                if pausa_segundos:
+                    time.sleep(pausa_segundos)
+
+            enviar_telegram(texto_oferta, silencioso=silencioso, es_permanente=es_permanente)
+            envio_numero += 1
+            if pausa_segundos:
+                time.sleep(pausa_segundos)
+            continue
+
+        if len(mensaje_actual) + len(texto_oferta) <= max_len:
+            mensaje_actual += texto_oferta
+            continue
+
+        enviar_telegram(mensaje_actual, silencioso=silencioso, es_permanente=es_permanente)
+        envio_numero += 1
+        if pausa_segundos:
+            time.sleep(pausa_segundos)
+
+        inicio = prefijo_para_nuevo_mensaje()
+        candidato = f"{inicio}{texto_oferta}"
+        if len(candidato) <= max_len:
+            mensaje_actual = candidato
+        else:
+            if inicio and len(inicio.strip()) <= max_len:
+                enviar_telegram(inicio.strip(), silencioso=silencioso, es_permanente=es_permanente)
+                envio_numero += 1
+                if pausa_segundos:
+                    time.sleep(pausa_segundos)
+            enviar_telegram(texto_oferta, silencioso=silencioso, es_permanente=es_permanente)
+            envio_numero += 1
+            if pausa_segundos:
+                time.sleep(pausa_segundos)
+            mensaje_actual = ""
+
+    if mensaje_actual:
+        enviar_telegram(mensaje_actual, silencioso=silencioso, es_permanente=es_permanente)
+
 def limpiar_chat():
     global MENSAJES_ENVIADOS
     url_delete = f"https://api.telegram.org/bot{TOKEN}/deleteMessage"
@@ -137,7 +214,7 @@ def limpiar_chat():
     MENSAJES_ENVIADOS.clear()
 
 def escuchar_botones():
-    global CACHE_RESULTADOS
+    global CACHE_RESULTADOS, ULTIMO_AVISO_NO_LISTO_TS
     offset = 0
     url_updates = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     url_answer = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
@@ -187,24 +264,25 @@ def escuchar_botones():
                                     },
                                     timeout=REQUEST_TIMEOUT
                                 )
-                                enviar_telegram(
-                                    "⏳ <i>El bot recién inició o aún no terminó de cargar datos. Esperá 1 minuto e intentá de nuevo.</i>",
-                                    silencioso=True,
-                                    es_permanente=False
-                                )
+                                if (ahora - ULTIMO_AVISO_NO_LISTO_TS) >= 60:
+                                    enviar_telegram(
+                                        "⏳ <i>El bot recién inició o aún no terminó de cargar datos. Esperá 1 minuto e intentá de nuevo.</i>",
+                                        silencioso=True,
+                                        es_permanente=False
+                                    )
+                                    ULTIMO_AVISO_NO_LISTO_TS = ahora
                                 continue
 
                             requests.get(url_answer, params={"callback_query_id": cb_id}, timeout=REQUEST_TIMEOUT)
 
                             limpiar_chat()
-                            enviar_telegram("📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>", es_permanente=False)
-                            bloque = ""
-                            for idx, txt in enumerate(CACHE_RESULTADOS, 1):
-                                bloque += txt
-                                if idx % 10 == 0 or idx == len(CACHE_RESULTADOS):
-                                    enviar_telegram(bloque, es_permanente=False)
-                                    bloque = ""
-                                    time.sleep(1)
+                            enviar_ofertas_sin_cortes(
+                                CACHE_RESULTADOS,
+                                encabezado="📊 <b>LISTADO ACTUAL DE CARGOS PUBLICADOS:</b>",
+                                es_permanente=False,
+                                repetir_encabezado=False,
+                                pausa_segundos=1
+                            )
             else:
                 print(f"[!] getUpdates devolvió {r.status_code}: {r.text}", flush=True)
         except Exception as e:
@@ -249,6 +327,42 @@ def obtener_top_postulantes(session, id_oferta):
     except:
         return "<i>Error en ranking</i>"
     return "<i>Sin datos</i>"
+
+def formatear_fecha_argentina(valor, tz_obj):
+    if valor in (None, "", "-"):
+        return "N/A"
+
+    if isinstance(valor, (list, tuple)):
+        if not valor:
+            return "N/A"
+        valor = valor[0]
+
+    try:
+        if isinstance(valor, (int, float)):
+            ts = float(valor)
+            if ts > 1e12:
+                ts /= 1000.0
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_obj)
+            return dt.strftime("%d/%m/%Y %H:%M")
+
+        texto = str(valor).strip()
+        if not texto:
+            return "N/A"
+
+        if texto.isdigit():
+            ts = float(texto)
+            if ts > 1e12:
+                ts /= 1000.0
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz_obj)
+            return dt.strftime("%d/%m/%Y %H:%M")
+
+        dt = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(tz_obj)
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return "N/A"
 
 def monitorear():
     global CACHE_RESULTADOS
@@ -299,6 +413,22 @@ def monitorear():
                     procesados_en_vuelta = set()
 
                     for info in hallazgos:
+                        # Variables disponibles del JSON oficial (dict info) para futuros usos:
+                        # estado, tipooferta, ige, miercoles, descripcionnivel, martes, cuilautor,
+                        # supl_hasta, turno, idoferta, sabado, id, idpostulacion, orden, iddetalle,
+                        # cargo, telefono, tomaposesion, pdistrito, designado, supl_revista,
+                        # domiciliodesempeno, reemp_apeynom, licenciamaternidad, numdistrito,
+                        # areaincumbencia, fechanacimiento, finoferta, listadoorigen, cuil,
+                        # cupof, postulacionfechacarga, tipooferta_id, supl_desde, ddjjsalud,
+                        # reemp_cuil, estadopostulacion, escuela, recalificadoart, reside,
+                        # iniciooferta, pun_titu, prioridad, hsmodulos, nombres, snombres,
+                        # hojaruta, cursodivision, domicilio, art139140, puntaje, idsuna,
+                        # excedido, apellido, distritoresidencia, localidad, lunes, email,
+                        # infectocontagiosa, reemp_motivo, descdistrito, TieneCargoTitular,
+                        # jueves, esforte, nivelmodalidad, viernes, descripcionarea,
+                        # descripcioncargo, pun_res, perteneceatr, cambiofunciones121,
+                        # ult_movimiento, tienehojaruta, certificadocarrera1,
+                        # certificadocarrera2, _version_, timestamp.
                         id_o = str(info.get('idoferta'))
                         
                         # Si ya procesamos este ID en este mismo ciclo de búsqueda, lo saltamos
@@ -354,14 +484,17 @@ def monitorear():
                             jornada_texto = "Simple"
                         else:
                             jornada_texto = html.escape(jornada_raw) if jornada_raw else "N/A"
-                        
+
+                        inicio_oferta_txt = formatear_fecha_argentina(info.get('iniciooferta'), tz_ar)
+                        inicio_oferta = html.escape(inicio_oferta_txt)
+
                         if estado_actual == "PUBLICADA":
                             ranking = obtener_top_postulantes(session, id_o)
                             link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
                             
                             txt = f"🏫 <b>Escuela:</b> {escuela}\n"
-                            txt += f"📋 <b>ID Oferta:</b> <code>{id_o}</code>\n"
                             txt += f"📚 <b>Área:</b> <code>{cargo}</code>\n"
+                            txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
                             
                             # Mostrar Curso/División solo si hay datos útiles
                             if curso != "-" or division != "-":
@@ -379,8 +512,8 @@ def monitorear():
 
                         elif cambio_a_designada:
                             txt = f"🏫 <b>Escuela:</b> {escuela}\n"
-                            txt += f"📋 <b>ID Oferta:</b> <code>{id_o}</code>\n"
                             txt += f"📚 <b>Área:</b> <code>{cargo}</code>\n"
+                            txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
                             if curso != "-" or division != "-":
                                 txt += f"👥 <b>Curso/Div:</b> {curso} - {division}\n"
                             txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
@@ -394,22 +527,23 @@ def monitorear():
                     hora_str = ahora.strftime("%H:%M")
 
                     if buffer_nuevas:
-                        bloque = ""
-                        for idx, txt in enumerate(buffer_nuevas, 1):
-                            bloque += txt
-                            if idx % 10 == 0 or idx == len(buffer_nuevas):
-                                enviar_telegram(f"🚨 <b>NUEVOS CARGOS ({hora_str} hs)</b> 🚨\n\n{bloque}", es_permanente=False)
-                                bloque = ""
-                                time.sleep(2)
+                        enviar_ofertas_sin_cortes(
+                            buffer_nuevas,
+                            encabezado=f"🚨 <b>NUEVOS CARGOS ({hora_str} hs)</b> 🚨",
+                            es_permanente=False,
+                            repetir_encabezado=True,
+                            pausa_segundos=2
+                        )
                                 
                     if buffer_cerradas:
-                        bloque = ""
-                        for idx, txt in enumerate(buffer_cerradas, 1):
-                            bloque += txt
-                            if idx % 15 == 0 or idx == len(buffer_cerradas):
-                                enviar_telegram(f"❌ <b>CARGOS DESIGNADOS (Cerrados)</b> ❌\n\n{bloque}", silencioso=True, es_permanente=False)
-                                bloque = ""
-                                time.sleep(2)
+                        enviar_ofertas_sin_cortes(
+                            buffer_cerradas,
+                            encabezado="❌ <b>CARGOS DESIGNADOS (Cerrados)</b> ❌",
+                            silencioso=True,
+                            es_permanente=False,
+                            repetir_encabezado=True,
+                            pausa_segundos=2
+                        )
                     
                     if (buffer_nuevas or buffer_cerradas) and hora_actual in HORAS_REPORTE:
                         ultimo_reporte_enviado = hora_actual
