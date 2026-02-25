@@ -134,7 +134,7 @@ def monitorear():
     # Reemplazamos el set() por un diccionario para guardar {id: estado}
     ofertas_estados_local = {} 
     
-    HORAS_REPORTE = {6, 9, ,12, 15, 17, 20, 20, 22}
+    HORAS_REPORTE = {6, 9, 12, 15, 17, 20, 20, 22}
     ultimo_reporte_enviado = None
     tz_ar = timezone(timedelta(hours=-3))
     
