@@ -5,7 +5,6 @@ import requests
 import urllib3
 import time
 import threading
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from requests.adapters import HTTPAdapter
@@ -27,8 +26,6 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 CACHE_RESULTADOS = []
 MENSAJES_ENVIADOS = set()
 MENSAJE_POR_OFERTA = {}
-INICIO_BOT_TS = time.time()
-ULTIMO_AVISO_NO_LISTO_TS = 0
 ULTIMA_CARGA_OK_TS = 0
 CACHE_LOCK = threading.Lock()
 CALLBACKS_PROCESADOS = {}
@@ -67,6 +64,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+# --- INFRAESTRUCTURA WEB / TRANSPORTE ---
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), SimpleHandler)
@@ -85,6 +83,7 @@ class TLSAdapter(HTTPAdapter):
             kwargs['ssl_context'] = context
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
+# --- TELEGRAM: ENVÍO / EDICIÓN / ARMADO DE MENSAJES ---
 def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=False):
     global MENSAJES_ENVIADOS
     if not TOKEN or not CHAT_ID:
@@ -129,7 +128,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
                         if not es_permanente:
                             MENSAJES_ENVIADOS.add(message_id)
                     return
-                except:
+                except Exception:
                     pass
             print(f"[-] Error enviando Telegram: {error}", flush=True)
 
@@ -153,6 +152,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
         enviar_parte(parte)
     return sent_ids
 
+# --- UPSTASH: HELPERS, LOCKS Y DEDUPE DISTRIBUIDO ---
 def _upstash_headers():
     if UPSTASH_URL and UPSTASH_TOKEN:
         return UPSTASH_URL.rstrip('/'), {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
@@ -301,6 +301,7 @@ def editar_mensaje_telegram(message_id, texto):
         return False
     return False
 
+# --- TELEGRAM: UTILIDADES DE LISTADO Y LIMPIEZA ---
 def enviar_ofertas_sin_cortes(
     ofertas,
     encabezado=None,
@@ -383,12 +384,13 @@ def limpiar_chat():
     for msg_id in list(MENSAJES_ENVIADOS):
         try:
             requests.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
-        except:
+        except Exception:
             pass
     MENSAJES_ENVIADOS.clear()
 
+# --- TELEGRAM: LISTENER DE BOTONES ---
 def escuchar_botones():
-    global CACHE_RESULTADOS, ULTIMO_AVISO_NO_LISTO_TS, ULTIMA_CARGA_OK_TS
+    global CACHE_RESULTADOS, ULTIMA_CARGA_OK_TS
     if not adquirir_lock_instancia(LOCK_TTL_SEG, LISTENER_LOCK_KEY):
         print("[!] Listener pasivo: lock tomado por otra instancia.", flush=True)
         return
@@ -410,7 +412,7 @@ def escuchar_botones():
             updates = r.json().get("result", [])
             if updates:
                 offset = updates[-1]["update_id"] + 1
-    except:
+    except Exception:
         pass
     
     try:
@@ -441,12 +443,12 @@ def escuchar_botones():
                                     continue
                                 
                                 ultimo_clic = ahora
-                                if (ahora - INICIO_BOT_TS) < 60 or ULTIMA_CARGA_OK_TS == 0:
+                                if ULTIMA_CARGA_OK_TS == 0:
                                     requests.get(
                                         url_answer,
                                         params={
                                             "callback_query_id": cb_id,
-                                            "text": "⏳ El bot recién inició. Esperá 1 minuto e intentá de nuevo.",
+                                            "text": "⏳ El bot todavía está cargando datos. Intentá de nuevo en unos segundos.",
                                             "show_alert": False
                                         },
                                         timeout=REQUEST_TIMEOUT
@@ -496,6 +498,7 @@ def escuchar_botones():
     finally:
         liberar_lock_instancia(LISTENER_LOCK_KEY)
 
+# --- ABC: EXTRACCIÓN / FORMATEO DE DATOS ---
 def obtener_top_postulantes(session, id_oferta):
     url_p = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.postulante/select"
     params = {"q": f"idoferta:{id_oferta}", "sort": "puntaje desc", "rows": "10", "wt": "json"}
@@ -531,7 +534,7 @@ def obtener_top_postulantes(session, id_oferta):
                 
             if activos_mostrados == 0: return "<i>Postulantes inactivos (¡Vía libre!)</i>"
             return res
-    except:
+    except Exception:
         return "<i>Error en ranking</i>"
     return "<i>Sin datos</i>"
 
@@ -571,6 +574,7 @@ def formatear_fecha_argentina(valor, tz_obj):
     except Exception:
         return "N/A"
 
+# --- MONITOREO PRINCIPAL ---
 def monitorear():
     global CACHE_RESULTADOS, ULTIMA_CARGA_OK_TS
     if not adquirir_lock_instancia(LOCK_TTL_SEG, MONITOR_LOCK_KEY):
@@ -644,7 +648,7 @@ def monitorear():
                                     resp = requests.get(f"{base_url}/get/oferta_{id_o}", headers=headers, timeout=5)
                                     if resp.status_code == 200:
                                         estado_previo = resp.json().get("result")
-                                except:
+                                except Exception:
                                     estado_previo = ofertas_estados_local.get(id_o)
                             else:
                                 estado_previo = ofertas_estados_local.get(id_o)
@@ -663,7 +667,7 @@ def monitorear():
                                 if UPSTASH_URL and UPSTASH_TOKEN:
                                     try:
                                         requests.get(f"{base_url}/set/oferta_{id_o}/{estado_actual}", headers=headers, timeout=5)
-                                    except:
+                                    except Exception:
                                         ofertas_estados_local[id_o] = estado_actual
                                 else:
                                     ofertas_estados_local[id_o] = estado_actual
