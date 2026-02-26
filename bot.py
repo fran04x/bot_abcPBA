@@ -805,7 +805,7 @@ def monitorear():
                                     txt += f"🔴 <b>Hasta:</b> {hasta}\n"
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
                                     txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
-                                    txt += "───────────────────\n"
+                                    txt += "────────────────────────\n"
 
                                     temp_cache.append(txt)
 
@@ -824,7 +824,7 @@ def monitorear():
                                     txt += f"📝 <b>Revista:</b> {revista}\n"
                                     txt += f"🟢 <b>Desde:</b> {desde}\n"
                                     txt += f"🔴 <b>Hasta:</b> {hasta}\n"
-                                    txt += "───────────────────\n"
+                                    txt += "────────────────────────\n"
                                     buffer_cerradas.append((id_o, txt))
 
                             with CACHE_LOCK:
@@ -886,21 +886,23 @@ def monitorear():
 
                 # --- EL NUEVO SUEÑO LIGERO OPTIMIZADO ---
                 lock_perdido = False
-                reporte_8am_ejecutado = False # Bandera para no repetir dentro del mismo minuto
+                HORAS_AUTO = {8, 12, 17}
+                ejecutado_en_minuto = False 
 
                 for i in range(60):
                     ahora_check = datetime.now(tz_ar)
                     
-                    # Verificamos si son las 8:00 AM y no se ejecutó en este ciclo
-                    if ahora_check.hour == 8 and ahora_check.minute == 0 and not reporte_8am_ejecutado:
-                        print("[*] Son las 08:00 AM. Iniciando reporte automático...", flush=True)
-                        FORZAR_REFRESH.set()
-                        reporte_8am_ejecutado = True
+                    # Verificación de horarios programados
+                    if ahora_check.hour in HORAS_AUTO and ahora_check.minute == 0:
+                        if not ejecutado_en_minuto:
+                            FORZAR_REFRESH.set()
+                            ejecutado_en_minuto = True
+                    else:
+                        ejecutado_en_minuto = False
 
                     desperto_por_boton = FORZAR_REFRESH.wait(timeout=15.0) 
                     
                     if desperto_por_boton:
-                        print("[*] Despertado por señal (Botón o Automático). Buscando datos...", flush=True)
                         break 
                     
                     if i % 4 == 0:
