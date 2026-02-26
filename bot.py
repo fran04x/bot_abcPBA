@@ -8,6 +8,7 @@ import threading
 import signal
 import sys
 import atexit
+import re
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from requests.adapters import HTTPAdapter
@@ -608,6 +609,27 @@ def formatear_fecha_argentina(valor, tz_obj):
         return dt.strftime("%d/%m/%Y %H:%M")
     except Exception:
         return "N/A"
+# --- LIMPIEZA DE CARACTERES EXCESIVOS EN DIRECCIÓN ---
+def limpiar_direccion(texto):
+    if not texto or str(texto).strip() in ("N/A", "-", ""):
+        return "N/A"
+    
+    # 1. Colapsar múltiples espacios en uno solo
+    t = re.sub(r'\s+', ' ', str(texto)).strip()
+    
+    # 2. Eliminar números idénticos repetidos al final (ej: "2730 2730")
+    partes = t.split()
+    if len(partes) >= 2 and partes[-1].isdigit() and partes[-1] == partes[-2]:
+        t = " ".join(partes[:-1])
+    
+    # 3. Aplicar formato Título (Primera letra de cada palabra en mayúscula)
+    t = t.title()
+    
+    # 4. Corregir abreviaturas específicas para que no queden extrañas
+    # .title() convierte "E/" en "E/" o "Bº" en "Bº", pero "e/" queda mejor en minúscula
+    t = t.replace(" E/ ", " e/ ").replace(" Bº", " Bº")
+    
+    return t
 
 # --- MONITOREO PRINCIPAL ---
 def monitorear():
@@ -662,7 +684,7 @@ def monitorear():
         # -----------------------------------------------
 
         ofertas_estados_local = {}
-        HORAS_REPORTE = {6, 8, 11, 15, 17, 20}
+        HORAS_REPORTE = {8, 11, 14, 17, 20}
         ultimo_reporte_enviado = None
         tz_ar = timezone(timedelta(hours=-3))
 
@@ -766,7 +788,8 @@ def monitorear():
                                 escuela = html.escape(str(info.get('escuela', 'N/A')))
                                 cargo = html.escape(str(info.get('cargo', 'N/A')))
                                 curso_division = html.escape(str(info.get('cursodivision', '-')).strip())
-                                direccion = html.escape(str(info.get('domiciliodesempeno', info.get('domicilio', 'N/A'))).strip())
+                                direccion_raw = str(info.get('domiciliodesempeno', info.get('domicilio', 'N/A')))
+                                direccion = html.escape(limpiar_direccion(direccion_raw))
                                 revista_raw = str(info.get('supl_revista', '')).upper()
                                 if revista_raw == 'S':
                                     revista = "Suplencia"
@@ -805,7 +828,7 @@ def monitorear():
                                     txt += f"🔴 <b>Hasta:</b> {hasta}\n"
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
                                     txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
-                                    txt += "────────────────────────\n"
+                                    txt += "───────────────────\n"
 
                                     temp_cache.append(txt)
 
@@ -824,7 +847,7 @@ def monitorear():
                                     txt += f"📝 <b>Revista:</b> {revista}\n"
                                     txt += f"🟢 <b>Desde:</b> {desde}\n"
                                     txt += f"🔴 <b>Hasta:</b> {hasta}\n"
-                                    txt += "────────────────────────\n"
+                                    txt += "───────────────────\n"
                                     buffer_cerradas.append((id_o, txt))
 
                             with CACHE_LOCK:
