@@ -852,8 +852,19 @@ def monitorear():
 
                             if buffer_nuevas:
                                 for id_o, txt in buffer_nuevas:
+                                    # Verificamos si el mensaje contiene la etiqueta de Jornada Completa
+                                    es_jc = "🔴 COMPLETA 🔴" in txt
+                                    
                                     mensaje_nuevo = f"🚨 <b>NUEVO CARGO ({hora_str} hs)</b> 🚨\n\n{txt}"
-                                    sent_ids = enviar_telegram(mensaje_nuevo, es_permanente=False)
+                                    
+                                    # Solo emitirá sonido (silencioso=False) si es Jornada Completa.
+                                    # De lo contrario, se envía silenciado.
+                                    sent_ids = enviar_telegram(
+                                        mensaje_nuevo, 
+                                        silencioso=(not es_jc), 
+                                        es_permanente=False
+                                    )
+                                    
                                     if sent_ids:
                                         guardar_mensaje_oferta(id_o, sent_ids[0])
                                     time.sleep(2)
