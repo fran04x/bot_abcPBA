@@ -38,6 +38,7 @@ MENSAJES_LOCK = threading.Lock()
 OFERTA_LOCK = threading.Lock()
 CALLBACK_LOCK = threading.Lock()
 UPSTASH_SESSION = requests.Session()
+TELEGRAM_SESSION = requests.Session()
 INSTANCE_LOCK_KEY = os.environ.get("INSTANCE_LOCK_KEY", "abcbot_instance_lock")
 LISTENER_LOCK_KEY = os.environ.get("LISTENER_LOCK_KEY", f"{INSTANCE_LOCK_KEY}:listener")
 MONITOR_LOCK_KEY = os.environ.get("MONITOR_LOCK_KEY", f"{INSTANCE_LOCK_KEY}:monitor")
@@ -116,7 +117,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
             payload_plain["reply_markup"] = payload["reply_markup"]
 
         try:
-            response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            response = TELEGRAM_SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
             if data.get("ok"):
@@ -131,7 +132,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
             status = getattr(getattr(error, "response", None), "status_code", None)
             if status is not None and 400 <= status < 500:
                 try:
-                    resp_plain = requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
+                    resp_plain = TELEGRAM_SESSION.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
                     resp_plain.raise_for_status()
                     data = resp_plain.json()
                     if data.get("ok"):
@@ -335,11 +336,11 @@ def editar_mensaje_telegram(message_id, texto):
     }
 
     try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        r = TELEGRAM_SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200 and r.json().get("ok"):
             return True
         if 400 <= r.status_code < 500:
-            r2 = requests.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
+            r2 = TELEGRAM_SESSION.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
             return r2.status_code == 200 and r2.json().get("ok")
     except Exception:
         return False
@@ -438,7 +439,7 @@ def limpiar_chat():
     # 3. Borramos todos de Telegram
     for msg_id in list(mensajes_a_borrar):
         try:
-            requests.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
+            TELEGRAM_SESSION.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
         except Exception:
             pass
             
@@ -465,13 +466,13 @@ def escuchar_botones():
         ultimo_clic = 0
 
         try:
-            requests.post(url_delete_webhook, json={"drop_pending_updates": False}, timeout=REQUEST_TIMEOUT)
+            TELEGRAM_SESSION.post(url_delete_webhook, json={"drop_pending_updates": False}, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             pass
         
         # Purga inicial rápida
         try:
-            r = requests.get(url_updates, params={"offset": offset, "timeout": 5}, timeout=10)
+            r = TELEGRAM_SESSION.get(url_updates, params={"offset": offset, "timeout": 5}, timeout=10)
             if r.status_code == 200:
                 updates = r.json().get("result", [])
                 if updates:
@@ -487,7 +488,7 @@ def escuchar_botones():
 
                 try:
                     # Usamos timeout=20 para que despierte y pueda renovar el candado de 60s
-                    r = requests.get(url_updates, params={"offset": offset, "timeout": 20}, timeout=30)
+                    r = TELEGRAM_SESSION.get(url_updates, params={"offset": offset, "timeout": 20}, timeout=30)
                     if r.status_code == 200:
                         updates = r.json().get("result", [])
                         for up in updates:
@@ -498,13 +499,13 @@ def escuchar_botones():
                                 data = cb.get("data")
 
                                 if callback_ya_procesado(cb_id):
-                                    requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Ya procesado", "show_alert": False}, timeout=REQUEST_TIMEOUT)
+                                    TELEGRAM_SESSION.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Ya procesado", "show_alert": False}, timeout=REQUEST_TIMEOUT)
                                     continue
                                 
                                 if data == CALLBACK_GET_RESULTADOS:
                                     ahora = time.time()
                                     if ahora - ultimo_clic < 3:
-                                        requests.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Cargando...", "show_alert": False}, timeout=REQUEST_TIMEOUT)
+                                        TELEGRAM_SESSION.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Cargando...", "show_alert": False}, timeout=REQUEST_TIMEOUT)
                                         continue
                                     
                                     ultimo_clic = ahora
@@ -513,7 +514,7 @@ def escuchar_botones():
                                     FORZAR_REFRESH.set()
                                     
                                     if ULTIMA_CARGA_OK_TS == 0:
-                                        requests.get(
+                                        TELEGRAM_SESSION.get(
                                             url_answer,
                                             params={
                                                 "callback_query_id": cb_id,
@@ -523,7 +524,7 @@ def escuchar_botones():
                                             timeout=REQUEST_TIMEOUT
                                         )
                                     else:
-                                        requests.get(
+                                        TELEGRAM_SESSION.get(
                                             url_answer,
                                             params={
                                                 "callback_query_id": cb_id,
@@ -533,7 +534,7 @@ def escuchar_botones():
                                             timeout=REQUEST_TIMEOUT
                                         )
                                 elif isinstance(data, str) and data.startswith("get_resultados:"):
-                                    requests.get(
+                                    TELEGRAM_SESSION.get(
                                         url_answer,
                                         params={
                                             "callback_query_id": cb_id,
@@ -676,11 +677,11 @@ def monitorear():
         if base_url:
             try:
                 # Buscamos si había un mensaje de arranque viejo
-                resp = requests.get(f"{base_url}/get/msg_arranque_id", headers=headers, timeout=5)
+                resp = UPSTASH_SESSION.get(f"{base_url}/get/msg_arranque_id", headers=headers, timeout=5)
                 if resp.status_code == 200 and resp.json().get("result"):
                     viejo_id = resp.json().get("result")
                     # Lo borramos de Telegram
-                    requests.post(f"https://api.telegram.org/bot{TOKEN}/deleteMessage", json={"chat_id": CHAT_ID, "message_id": int(viejo_id)}, timeout=5)
+                    TELEGRAM_SESSION.post(f"https://api.telegram.org/bot{TOKEN}/deleteMessage", json={"chat_id": CHAT_ID, "message_id": int(viejo_id)}, timeout=5)
             except Exception:
                 pass
 
@@ -691,7 +692,7 @@ def monitorear():
         # Guardamos el ID de este nuevo saludo en Upstash para borrarlo en el próximo reinicio
         if base_url and sent_ids:
             try:
-                requests.get(f"{base_url}/set/msg_arranque_id/{sent_ids[0]}", headers=headers, timeout=5)
+                UPSTASH_SESSION.get(f"{base_url}/set/msg_arranque_id/{sent_ids[0]}", headers=headers, timeout=5)
             except Exception:
                 pass
         # -----------------------------------------------
@@ -771,7 +772,7 @@ def monitorear():
                                     base_url = UPSTASH_URL.rstrip('/')
                                     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
                                     try:
-                                        resp = requests.get(f"{base_url}/get/oferta_{id_o}", headers=headers, timeout=5)
+                                        resp = UPSTASH_SESSION.get(f"{base_url}/get/oferta_{id_o}", headers=headers, timeout=5)
                                         if resp.status_code == 200:
                                             estado_previo = resp.json().get("result")
                                     except Exception:
@@ -793,7 +794,7 @@ def monitorear():
                                     if UPSTASH_URL and UPSTASH_TOKEN:
                                         try:
                                             # Se añade /EX/604800 para que el dato se autodestruya en 7 días exactos
-                                            requests.get(f"{base_url}/set/oferta_{id_o}/{estado_actual}/EX/604800", headers=headers, timeout=5)
+                                            UPSTASH_SESSION.get(f"{base_url}/set/oferta_{id_o}/{estado_actual}/EX/604800", headers=headers, timeout=5)
                                         except Exception:
                                             ofertas_estados_local[id_o] = estado_actual
                                     else:
@@ -829,17 +830,22 @@ def monitorear():
                                 if estado_actual == "PUBLICADA":
                                     ranking = obtener_top_postulantes(session, id_o)
                                     link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}&_t={ts}"
-                                    txt = f"🏫 <b>Escuela:</b> <code>{escuela}</code>\n"
+                                    # Bloque de título y ubicación
+                                    txt = f"🏫 <b>{escuela}</b>\n"
                                     if direccion not in ("N/A", "-", ""):
-                                        txt += f"📍 <b>Dirección:</b> {direccion}\n"
-                                    txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
-                                    txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
+                                        txt += f"📍 {direccion}\n"
+                                    txt += "\n"
+
+                                    # Bloque temporal
+                                    txt += f"<b>Apertura/Cierre:</b> {inicio_oferta} — {cierre_oferta}\n"
+                                    txt += f"<b>Periodo:</b> {desde} — {hasta}\n\n"
+
+                                    # Bloque técnico
                                     if curso_division not in ("-", "", "N/A"):
-                                        txt += f"👥 <b>Curso/Div:</b> {curso_division}\n"
-                                    txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
-                                    txt += f"📝 <b>Revista:</b> {revista}\n"
-                                    txt += f"🟢 <b>Desde:</b> {desde}\n"
-                                    txt += f"🔴 <b>Hasta:</b> {hasta}\n"
+                                        txt += f"<b>Curso/Div:</b> {curso_division} | "
+                                    txt += f"<b>Jornada:</b> {jornada_texto} | <b>Revista:</b> {revista}\n\n"
+
+                                    # Bloque de puntaje
                                     txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
                                     txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
                                     txt += "───────────────────\n"
