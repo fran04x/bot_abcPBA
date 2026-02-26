@@ -540,7 +540,7 @@ def obtener_top_postulantes(session, id_oferta):
     params = {"q": f"idoferta:{id_oferta}", "sort": "puntaje desc", "rows": "10", "wt": "json"}
     try:
         r = session.get(url_p, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
-        r.encoding = 'utf-8'
+        r.encoding = 'latin-1'
         if r.status_code == 200:
             docs = r.json().get("response", {}).get("docs", [])
             if not docs: return "<i>Sin postulantes aún</i>\n"
@@ -554,14 +554,17 @@ def obtener_top_postulantes(session, id_oferta):
                 
                 apellido = str(p.get('apellido', '')).strip().title()
                 nombres = str(p.get('nombres', p.get('nombre', ''))).strip().title()
-                
-                if apellido or nombres:
-                    primer_nombre = nombres.split()[0] if nombres else ""
-                    inicial = f"{primer_nombre[0]}." if primer_nombre else ""
-                    nombre_final = f"{inicial} {apellido}".strip()
-                else:
-                    nombre_final = str(p.get('apellidoynombre', 'Docente')).strip().title()
 
+                # Si ABC agrupa todo en 'nombres', se asume formato "APELLIDO NOMBRE"
+                if not apellido and nombres:
+                    partes = nombres.split()
+                    apellido = partes[0]
+                    nombres = " ".join(partes[1:]) if len(partes) > 1 else ""
+
+                primer_nombre = nombres.split()[0] if nombres else ""
+                inicial = f"{primer_nombre[0]}." if primer_nombre else ""
+                
+                nombre_final = f"{inicial} {apellido}".strip() if apellido else "Docente"
                 nombre_completo = html.escape(nombre_final)
                 puntaje = html.escape(str(p.get('puntaje', '0.00')))
                 
@@ -687,7 +690,7 @@ def monitorear():
                         # 1. Agregamos el sort en la API para que no nos oculte las ofertas nuevas
                         params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND (estado:"Publicada" OR estado:"Designada")', "rows": "1000", "wt": "json", "sort": "idoferta desc"}
                         r = session.get(url_solr, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
-                        r.encoding = 'utf-8'
+                        r.encoding = 'latin-1'
 
                         if r.status_code == 200:
                             docs = r.json().get("response", {}).get("docs", [])
@@ -761,8 +764,7 @@ def monitorear():
 
                                 escuela = html.escape(str(info.get('escuela', 'N/A')))
                                 cargo = html.escape(str(info.get('cargo', 'N/A')))
-                                curso = html.escape(str(info.get('curso', '-')))
-                                division = html.escape(str(info.get('division', '-')))
+                                curso_division = html.escape(str(info.get('cursodivision', '-')).strip())
                                 direccion = html.escape(str(info.get('domiciliodesempeno', info.get('domicilio', 'N/A'))).strip())
                                 revista_raw = str(info.get('supl_revista', '')).upper()
                                 if revista_raw == 'S':
@@ -772,8 +774,8 @@ def monitorear():
                                 else:
                                     revista = html.escape(revista_raw) if revista_raw else "N/A"
                                 cierre_oferta = html.escape(formatear_fecha_argentina(info.get('finoferta'), tz_ar))
-                                desde = html.escape(formatear_fecha_argentina(info.get('supl_desde'), tz_ar))
-                                hasta = html.escape(formatear_fecha_argentina(info.get('supl_hasta'), tz_ar))
+                                desde = html.escape(formatear_fecha_argentina(info.get('supl_desde'), tz_ar).split()[0])
+                                hasta = html.escape(formatear_fecha_argentina(info.get('supl_hasta'), tz_ar).split()[0])
 
                                 jornada_raw = str(info.get('jornada', '')).upper()
                                 if "JC" in jornada_raw:
