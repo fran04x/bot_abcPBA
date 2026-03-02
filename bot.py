@@ -61,6 +61,7 @@ try:
 except ValueError:
     TELEGRAM_MAX_MESSAGE_LEN = 4096
 TELEGRAM_MAX_MESSAGE_LEN = min(TELEGRAM_MAX_MESSAGE_LEN, 4096)
+DOC_PARTICIPANTE_PRIORITARIO = "30426801"
 
 if INSECURE_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -550,6 +551,33 @@ def escuchar_botones():
             liberar_lock_instancia(LISTENER_LOCK_KEY)
 
 # --- ABC: EXTRACCIÓN / FORMATEO DE DATOS ---
+def participante_es_objetivo(postulante, doc_objetivo):
+    objetivo = re.sub(r"\D", "", str(doc_objetivo or ""))
+    if not objetivo:
+        return False
+
+    posibles_campos = [
+        "documento", "dni", "nrodocumento", "nro_documento", "numerodocumento",
+        "nrodoc", "doc", "cuil", "cuit", "cuilcuit"
+    ]
+
+    for campo in posibles_campos:
+        valor = postulante.get(campo)
+        if valor in (None, ""):
+            continue
+
+        valores = valor if isinstance(valor, (list, tuple)) else [valor]
+        for item in valores:
+            texto = re.sub(r"\D", "", str(item))
+            if not texto:
+                continue
+            if texto == objetivo:
+                return True
+            if len(texto) >= 10 and objetivo in texto:
+                return True
+
+    return False
+
 def obtener_top_postulantes(session, id_oferta):
     url_p = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.postulante/select"
     params = {"q": f"idoferta:{id_oferta}", "sort": "puntaje desc", "rows": "10", "wt": "json"}
@@ -558,10 +586,16 @@ def obtener_top_postulantes(session, id_oferta):
         r.encoding = 'latin-1'
         if r.status_code == 200:
             docs = r.json().get("response", {}).get("docs", [])
-            if not docs: return "<i>Sin postulantes aún</i>\n"
+            if not docs:
+                return "<i>Sin postulantes aún</i>\n", False
             res = ""
             activos_mostrados = 0
+            contiene_doc_objetivo = False
             for p in docs:
+                es_participante_objetivo = participante_es_objetivo(p, DOC_PARTICIPANTE_PRIORITARIO)
+                if not contiene_doc_objetivo and es_participante_objetivo:
+                    contiene_doc_objetivo = True
+
                 estado_post = str(p.get('estadopostulacion', '')).upper()
                 designado = str(p.get('designado', '')).upper()
                 if estado_post != "ACTIVA" or designado in ["S", "Y"]:
@@ -582,16 +616,23 @@ def obtener_top_postulantes(session, id_oferta):
                 nombre_final = f"{inicial} {apellido}".strip() if apellido else "Docente"
                 nombre_completo = html.escape(nombre_final)
                 puntaje = html.escape(str(p.get('puntaje', '0.00')))
+
+                if es_participante_objetivo:
+                    nombre_completo = f"⭐⭐ {nombre_completo} ⭐⭐"
+                    puntaje = f"⭐⭐ {puntaje} pts ⭐⭐"
+                else:
+                    puntaje = f"{puntaje} pts"
                 
-                res += f"  {activos_mostrados + 1}º {nombre_completo} | <b>{puntaje} pts</b>\n"
+                res += f"  {activos_mostrados + 1}º {nombre_completo} | <b>{puntaje}</b>\n"
                 activos_mostrados += 1
                 if activos_mostrados >= 3: break
                 
-            if activos_mostrados == 0: return "<i>Postulantes inactivos (¡Vía libre!)</i>\n"
-            return res
+            if activos_mostrados == 0:
+                return "<i>Postulantes inactivos (¡Vía libre!)</i>\n", contiene_doc_objetivo
+            return res, contiene_doc_objetivo
     except Exception:
-        return "<i>Error en ranking</i>"
-    return "<i>Sin datos</i>"
+        return "<i>Error en ranking</i>", False
+    return "<i>Sin datos</i>", False
 
 def formatear_fecha_argentina(valor, tz_obj):
     if valor in (None, "", "-"):
@@ -698,7 +739,6 @@ def monitorear():
         # -----------------------------------------------
 
         ofertas_estados_local = {}
-        HORAS_REPORTE = {8, 11, 14, 17, 20}
         ultimo_reporte_enviado = None
         tz_ar = timezone(timedelta(hours=-3))
         ejecutado_en_minuto = False
@@ -712,6 +752,7 @@ def monitorear():
                 buffer_nuevas = []
                 buffer_cerradas = []
                 temp_cache = []
+                temp_cache_ordenable = []
                 fue_refresh_forzado = FORZAR_REFRESH.is_set()
                 FORZAR_REFRESH.clear()
 
@@ -826,9 +867,10 @@ def monitorear():
 
                                 inicio_oferta_txt = formatear_fecha_argentina(info.get('iniciooferta'), tz_ar)
                                 inicio_oferta = html.escape(inicio_oferta_txt)
+                                inicio_oferta_ts = extraer_timestamp(info.get('iniciooferta'))
 
                                 if estado_actual == "PUBLICADA":
-                                    ranking = obtener_top_postulantes(session, id_o)
+                                    ranking, contiene_doc_objetivo = obtener_top_postulantes(session, id_o)
                                     link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}"
                                     txt = f"🏫 <b>Escuela:</b> <code>{escuela}</code>\n"
                                     if direccion not in ("N/A", "-", ""):
@@ -845,10 +887,10 @@ def monitorear():
                                     txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
                                     txt += "───────────────────\n"
 
-                                    temp_cache.append(txt)
+                                    temp_cache_ordenable.append((contiene_doc_objetivo, inicio_oferta_ts, txt))
 
                                     if es_nueva_y_publicada:
-                                        buffer_nuevas.append((id_o, txt))
+                                        buffer_nuevas.append((id_o, txt, contiene_doc_objetivo, inicio_oferta_ts))
 
                                 elif cambio_a_designada:
                                     txt = f"🏫 <b>Escuela:</b> {escuela}\n"
@@ -864,6 +906,9 @@ def monitorear():
                                     txt += f"🔴 <b>Hasta:</b> {hasta}\n"
                                     txt += "───────────────────\n"
                                     buffer_cerradas.append((id_o, txt))
+
+                            temp_cache_ordenable.sort(key=lambda x: (x[0], x[1]))
+                            temp_cache = [item[2] for item in temp_cache_ordenable]
 
                             with CACHE_LOCK:
                                 CACHE_RESULTADOS = temp_cache
@@ -889,7 +934,8 @@ def monitorear():
                             hora_str = ahora.strftime("%H:%M")
 
                             if buffer_nuevas:
-                                for id_o, txt in buffer_nuevas:
+                                buffer_nuevas.sort(key=lambda x: (x[2], x[3]))
+                                for id_o, txt, _, _ in buffer_nuevas:
                                     # Verificamos si el mensaje contiene la etiqueta de Jornada Completa
                                     es_jc = "🔴 COMPLETA 🔴" in txt
                                     
@@ -921,11 +967,13 @@ def monitorear():
                                     eliminar_mensaje_oferta(id_o)
                                     time.sleep(2)
 
-                            if (buffer_nuevas or buffer_cerradas) and hora_actual in HORAS_REPORTE:
-                                ultimo_reporte_enviado = hora_actual
-                            elif not buffer_nuevas and not buffer_cerradas and hora_actual in HORAS_REPORTE and ultimo_reporte_enviado != hora_actual:
+                            slot_reporte = f"{ahora.strftime('%Y-%m-%d')} {hora_actual:02d}:{(ahora.minute // 30) * 30:02d}"
+
+                            if (buffer_nuevas or buffer_cerradas):
+                                ultimo_reporte_enviado = slot_reporte
+                            elif not buffer_nuevas and not buffer_cerradas and ahora.minute in (0, 30) and ultimo_reporte_enviado != slot_reporte:
                                 enviar_telegram(f"⏳ <i>{hora_str} hs - Bot activo: Monitoreando sin novedades por el momento.</i>", silencioso=True, es_permanente=False)
-                                ultimo_reporte_enviado = hora_actual
+                                ultimo_reporte_enviado = slot_reporte
                         else:
                             print(f"[!] Consulta devuelta con estado {r.status_code}", flush=True)
 
