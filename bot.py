@@ -841,9 +841,9 @@ def monitorear():
                                 txt += "\n"
                                 txt += "🏆 Puntajes\n"
                                 txt += f"{ranking}"
-                                txt += f"\n🌐 <a href=\"{url_oferta}\">Ver escuela en la WEB</a>"
+                                txt += f"\n🌐 <a href=\"{url_oferta}\">Ver postulaciones</a>"
 
-                                txt_listado = f"{txt}\n────────────────────────────────\n"
+                                txt_listado = f"{txt}\n─────────────────────\n"
 
                                 temp_cache_ordenable.append((contiene_doc_objetivo, inicio_oferta_ts, txt_listado))
                                 ofertas_en_vuelta_detalle[id_o] = (txt, contiene_doc_objetivo, inicio_oferta_ts, es_jornada_completa)
