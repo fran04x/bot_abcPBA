@@ -22,6 +22,13 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INSECURE_SSL = os.environ.get("INSECURE_SSL", "false").strip().lower() in {"1", "true", "yes"}
 REQUEST_TIMEOUT = (10, 30)
 
+try:
+    TELEGRAM_BUTTON_COOLDOWN_SECONDS = int(os.environ.get("TELEGRAM_BUTTON_COOLDOWN_SECONDS", "60"))
+    if TELEGRAM_BUTTON_COOLDOWN_SECONDS < 0:
+        TELEGRAM_BUTTON_COOLDOWN_SECONDS = 0
+except ValueError:
+    TELEGRAM_BUTTON_COOLDOWN_SECONDS = 60
+
 # Credenciales de Upstash Redis
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -29,13 +36,11 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 # --- MEMORIA GLOBAL ---
 CACHE_RESULTADOS = []
 MENSAJES_ENVIADOS = set()
-MENSAJE_POR_OFERTA = {}
 ULTIMA_CARGA_OK_TS = 0
 CACHE_LOCK = threading.Lock()
 FORZAR_REFRESH = threading.Event()
 CALLBACKS_PROCESADOS = {}
 MENSAJES_LOCK = threading.Lock()
-OFERTA_LOCK = threading.Lock()
 CALLBACK_LOCK = threading.Lock()
 UPSTASH_SESSION = requests.Session()
 TELEGRAM_SESSION = requests.Session()
@@ -61,6 +66,16 @@ try:
 except ValueError:
     TELEGRAM_MAX_MESSAGE_LEN = 4096
 TELEGRAM_MAX_MESSAGE_LEN = min(TELEGRAM_MAX_MESSAGE_LEN, 4096)
+
+try:
+    POST_FETCH_GRACE_SECONDS = int(os.environ.get("POST_FETCH_GRACE_SECONDS", "0"))
+    if POST_FETCH_GRACE_SECONDS < 0:
+        POST_FETCH_GRACE_SECONDS = 0
+    if POST_FETCH_GRACE_SECONDS > 120:
+        POST_FETCH_GRACE_SECONDS = 120
+except ValueError:
+    POST_FETCH_GRACE_SECONDS = 0
+
 DOC_PARTICIPANTE_PRIORITARIO = "30426801"
 
 if INSECURE_SSL:
@@ -96,7 +111,7 @@ class TLSAdapter(HTTPAdapter):
         return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
 # --- TELEGRAM: ENVÍO / EDICIÓN / ARMADO DE MENSAJES ---
-def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=False):
+def enviar_telegram(mensaje, silencioso=True, con_boton=False, es_permanente=False):
     global MENSAJES_ENVIADOS
     if not TOKEN or not CHAT_ID:
         return []
@@ -106,11 +121,24 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
     
     def enviar_parte(texto):
         nonlocal sent_ids
+        def registrar_envio_exitoso(data):
+            if not data.get("ok"):
+                return
+            message_id = data["result"]["message_id"]
+            sent_ids.append(message_id)
+            if not es_permanente:
+                with MENSAJES_LOCK:
+                    MENSAJES_ENVIADOS.add(message_id)
+                upstash_cmd("sadd", "mensajes_borrables", message_id)
+
         payload = {"chat_id": CHAT_ID, "text": texto, "parse_mode": "HTML", "disable_web_page_preview": True, "disable_notification": silencioso}
         
         if con_boton:
             payload["reply_markup"] = {
-                "inline_keyboard": [[{"text": "🔄 Actualizar resultados", "callback_data": CALLBACK_GET_RESULTADOS}]]
+                "inline_keyboard": [
+                    [{"text": "🌐 WEB ABC", "url": "https://misservicios.abc.gob.ar/actos.publicos.digitales/"}],
+                    [{"text": "🔄 Actualizar resultados", "callback_data": CALLBACK_GET_RESULTADOS}]
+                ]
             }
             
         payload_plain = {"chat_id": CHAT_ID, "text": texto, "disable_web_page_preview": True, "disable_notification": silencioso}
@@ -121,13 +149,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
             response = TELEGRAM_SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            if data.get("ok"):
-                message_id = data["result"]["message_id"]
-                sent_ids.append(message_id)
-                if not es_permanente:
-                    with MENSAJES_LOCK:
-                        MENSAJES_ENVIADOS.add(message_id)
-                    upstash_cmd("sadd", "mensajes_borrables", message_id) # <-- GUARDADO EN NUBE
+            registrar_envio_exitoso(data)
             return
         except requests.RequestException as error:
             status = getattr(getattr(error, "response", None), "status_code", None)
@@ -136,13 +158,7 @@ def enviar_telegram(mensaje, silencioso=False, con_boton=False, es_permanente=Fa
                     resp_plain = TELEGRAM_SESSION.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
                     resp_plain.raise_for_status()
                     data = resp_plain.json()
-                    if data.get("ok"):
-                        message_id = data["result"]["message_id"]
-                        sent_ids.append(message_id)
-                        if not es_permanente:
-                            with MENSAJES_LOCK:
-                                MENSAJES_ENVIADOS.add(message_id)
-                            upstash_cmd("sadd", "mensajes_borrables", message_id) # <-- GUARDADO EN NUBE
+                    registrar_envio_exitoso(data)
                     return
                 except Exception:
                     pass
@@ -271,86 +287,10 @@ def callback_ya_procesado(callback_id, ttl_seg=300, max_items=2000):
         CALLBACKS_PROCESADOS[callback_id] = ahora
         return False
 
-def guardar_mensaje_oferta(id_oferta, message_id):
-    with OFERTA_LOCK:
-        MENSAJE_POR_OFERTA[str(id_oferta)] = int(message_id)
-    base_url, headers = _upstash_headers()
-    if not base_url:
-        return
-    try:
-        # Se agrega /EX/604800 para que la memoria visual también caduque a los 7 días
-        UPSTASH_SESSION.get(f"{base_url}/set/oferta_msg_{id_oferta}/{int(message_id)}/EX/604800", headers=headers, timeout=5)
-    except Exception:
-        pass
-
-def obtener_mensaje_oferta(id_oferta):
-    clave = str(id_oferta)
-    with OFERTA_LOCK:
-        if clave in MENSAJE_POR_OFERTA:
-            return MENSAJE_POR_OFERTA[clave]
-
-    base_url, headers = _upstash_headers()
-    if not base_url:
-        return None
-
-    try:
-        resp = UPSTASH_SESSION.get(f"{base_url}/get/oferta_msg_{id_oferta}", headers=headers, timeout=5)
-        if resp.status_code == 200:
-            result = resp.json().get("result")
-            if result not in (None, ""):
-                with OFERTA_LOCK:
-                    MENSAJE_POR_OFERTA[clave] = int(result)
-                return int(result)
-    except Exception:
-        pass
-    return None
-
-def eliminar_mensaje_oferta(id_oferta):
-    with OFERTA_LOCK:
-        MENSAJE_POR_OFERTA.pop(str(id_oferta), None)
-    base_url, headers = _upstash_headers()
-    if not base_url:
-        return
-    try:
-        UPSTASH_SESSION.get(f"{base_url}/del/oferta_msg_{id_oferta}", headers=headers, timeout=5)
-    except Exception:
-        pass
-
-def editar_mensaje_telegram(message_id, texto):
-    if not TOKEN or not CHAT_ID:
-        return False
-
-    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
-    payload = {
-        "chat_id": CHAT_ID,
-        "message_id": message_id,
-        "text": texto,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-
-    payload_plain = {
-        "chat_id": CHAT_ID,
-        "message_id": message_id,
-        "text": texto,
-        "disable_web_page_preview": True,
-    }
-
-    try:
-        r = TELEGRAM_SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200 and r.json().get("ok"):
-            return True
-        if 400 <= r.status_code < 500:
-            r2 = TELEGRAM_SESSION.post(url, json=payload_plain, timeout=REQUEST_TIMEOUT)
-            return r2.status_code == 200 and r2.json().get("ok")
-    except Exception:
-        return False
-    return False
-
 def enviar_ofertas_sin_cortes(
     ofertas,
     encabezado=None,
-    silencioso=False,
+    silencioso=True,
     es_permanente=False,
     repetir_encabezado=False,
     pausa_segundos=1,
@@ -438,16 +378,47 @@ def limpiar_chat():
                 pass
                 
     # 3. Borramos todos de Telegram
+    mensajes_fallidos = set()
     for msg_id in list(mensajes_a_borrar):
         try:
-            TELEGRAM_SESSION.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
+            resp = TELEGRAM_SESSION.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
+            ok = False
+            if resp.status_code == 200:
+                try:
+                    ok = bool(resp.json().get("ok"))
+                except Exception:
+                    ok = False
+            if not ok:
+                mensajes_fallidos.add(msg_id)
         except Exception:
-            pass
+            mensajes_fallidos.add(msg_id)
+        time.sleep(0.05)
+
+    # Reintento inmediato de los que fallaron (mejora limpieza en ciclos con rate-limit)
+    if mensajes_fallidos:
+        time.sleep(0.5)
+        for msg_id in list(mensajes_fallidos):
+            try:
+                resp = TELEGRAM_SESSION.post(url_delete, json={"chat_id": CHAT_ID, "message_id": msg_id}, timeout=5)
+                ok = False
+                if resp.status_code == 200:
+                    try:
+                        ok = bool(resp.json().get("ok"))
+                    except Exception:
+                        ok = False
+                if ok:
+                    mensajes_fallidos.discard(msg_id)
+            except Exception:
+                pass
+            time.sleep(0.05)
             
     # 4. Limpiamos la memoria y la base de datos
     with MENSAJES_LOCK:
         MENSAJES_ENVIADOS.clear()
+        MENSAJES_ENVIADOS.update(mensajes_fallidos)
     upstash_cmd("del", "mensajes_borrables")
+    for msg_id in mensajes_fallidos:
+        upstash_cmd("sadd", "mensajes_borrables", msg_id)
 
 # --- TELEGRAM: LISTENER DE BOTONES ---
 def escuchar_botones():
@@ -505,8 +476,20 @@ def escuchar_botones():
                                 
                                 if data == CALLBACK_GET_RESULTADOS:
                                     ahora = time.time()
-                                    if ahora - ultimo_clic < 3:
-                                        TELEGRAM_SESSION.get(url_answer, params={"callback_query_id": cb_id, "text": "⏳ Cargando...", "show_alert": False}, timeout=REQUEST_TIMEOUT)
+                                    segundos_desde_ultimo = ahora - ultimo_clic
+                                    if segundos_desde_ultimo < TELEGRAM_BUTTON_COOLDOWN_SECONDS:
+                                        restante = int(TELEGRAM_BUTTON_COOLDOWN_SECONDS - segundos_desde_ultimo)
+                                        if restante < 1:
+                                            restante = 1
+                                        TELEGRAM_SESSION.get(
+                                            url_answer,
+                                            params={
+                                                "callback_query_id": cb_id,
+                                                "text": f"⏳ Esperá {restante}s para volver a actualizar.",
+                                                "show_alert": False
+                                            },
+                                            timeout=REQUEST_TIMEOUT
+                                        )
                                         continue
                                     
                                     ultimo_clic = ahora
@@ -539,7 +522,7 @@ def escuchar_botones():
                                         url_answer,
                                         params={
                                             "callback_query_id": cb_id,
-                                            "text": "♻️ Bot reiniciado. Usá el botón del último mensaje de inicio.",
+                                            "text": "♻️ Bot reiniciado. Usá el botón del último listado.",
                                             "show_alert": False
                                         },
                                         timeout=REQUEST_TIMEOUT
@@ -587,7 +570,7 @@ def obtener_top_postulantes(session, id_oferta):
         if r.status_code == 200:
             docs = r.json().get("response", {}).get("docs", [])
             if not docs:
-                return "<i>Sin postulantes aún</i>\n", False
+                return "Sin postulantes aún\n", False
             res = ""
             activos_mostrados = 0
             contiene_doc_objetivo = False
@@ -616,23 +599,21 @@ def obtener_top_postulantes(session, id_oferta):
                 nombre_final = f"{inicial} {apellido}".strip() if apellido else "Docente"
                 nombre_completo = html.escape(nombre_final)
                 puntaje = html.escape(str(p.get('puntaje', '0.00')))
+                puntaje_txt = f"{puntaje} pts"
 
                 if es_participante_objetivo:
-                    nombre_completo = f"⭐⭐ {nombre_completo} ⭐⭐"
-                    puntaje = f"⭐⭐ {puntaje} pts ⭐⭐"
+                    res += f"👉 {activos_mostrados + 1}º {nombre_completo} — {puntaje_txt}\n"
                 else:
-                    puntaje = f"{puntaje} pts"
-                
-                res += f"  {activos_mostrados + 1}º {nombre_completo} | <b>{puntaje}</b>\n"
+                    res += f"{activos_mostrados + 1}º {nombre_completo} — {puntaje_txt}\n"
                 activos_mostrados += 1
                 if activos_mostrados >= 3: break
                 
             if activos_mostrados == 0:
-                return "<i>Postulantes inactivos (¡Vía libre!)</i>\n", contiene_doc_objetivo
+                return "Postulantes inactivos (¡Vía libre!)\n", contiene_doc_objetivo
             return res, contiene_doc_objetivo
     except Exception:
-        return "<i>Error en ranking</i>", False
-    return "<i>Sin datos</i>", False
+        return "Error en ranking", False
+    return "Sin datos", False
 
 def formatear_fecha_argentina(valor, tz_obj):
     if valor in (None, "", "-"):
@@ -703,45 +684,10 @@ def monitorear():
         limpiar_chat()
         # ------------------------------------------------
 
-        msg_arranque = (
-            "✅ <b>INICIADO CORRECTAMENTE</b>\n\n"
-            "El sistema está activo y escaneando el ABC con estos filtros:\n"
-            "📍 <b>Distrito:</b> General Pueyrredón\n"
-            "📚 <b>Cargo:</b> Maestro de Grado (MG)\n"
-            "📌 <b>Estado:</b> Ofertas 'Publicadas'\n\n"
-            "🌐 <a href='https://misservicios.abc.gob.ar/actos.publicos.digitales/'>Ingresar a la página principal del portal</a>\n"
-            "👇 Podés pedir el listado actual tocando el botón de abajo."
-        )
-        
-        # --- BORRAR EL SALUDO ANTERIOR ---
-        base_url, headers = _upstash_headers()
-        if base_url:
-            try:
-                # Buscamos si había un mensaje de arranque viejo
-                resp = UPSTASH_SESSION.get(f"{base_url}/get/msg_arranque_id", headers=headers, timeout=5)
-                if resp.status_code == 200 and resp.json().get("result"):
-                    viejo_id = resp.json().get("result")
-                    # Lo borramos de Telegram
-                    TELEGRAM_SESSION.post(f"https://api.telegram.org/bot{TOKEN}/deleteMessage", json={"chat_id": CHAT_ID, "message_id": int(viejo_id)}, timeout=5)
-            except Exception:
-                pass
+        FORZAR_REFRESH.set()
 
-        # Enviamos el nuevo saludo inmortal
-        sent_ids = enviar_telegram(msg_arranque, silencioso=True, con_boton=True, es_permanente=True)
-        FORZAR_REFRESH.set() # <-- Nueva: Fuerza la primera carga apenas inicia
-        
-        # Guardamos el ID de este nuevo saludo en Upstash para borrarlo en el próximo reinicio
-        if base_url and sent_ids:
-            try:
-                UPSTASH_SESSION.get(f"{base_url}/set/msg_arranque_id/{sent_ids[0]}", headers=headers, timeout=5)
-            except Exception:
-                pass
-        # -----------------------------------------------
-
-        ofertas_estados_local = {}
-        ultimo_reporte_enviado = None
+        ofertas_vistas_local = set()
         tz_ar = timezone(timedelta(hours=-3))
-        ejecutado_en_minuto = False
 
         try:
             while True: # Bucle de trabajo
@@ -750,10 +696,8 @@ def monitorear():
                     break # Vuelve al modo pasivo
 
                 buffer_nuevas = []
-                buffer_cerradas = []
                 temp_cache = []
                 temp_cache_ordenable = []
-                fue_refresh_forzado = FORZAR_REFRESH.is_set()
                 FORZAR_REFRESH.clear()
 
                 try:
@@ -767,7 +711,7 @@ def monitorear():
 
                         url_solr = "https://servicios3.abc.gob.ar/valoracion.docente/api/apd.oferta.encabezado/select"
                         # 1. Agregamos el sort en la API para que no nos oculte las ofertas nuevas
-                        params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND (estado:"Publicada" OR estado:"Designada")', "rows": "1000", "wt": "json", "sort": "idoferta desc"}
+                        params = {"q": 'descdistrito:"GENERAL PUEYRREDON" AND estado:"Publicada"', "rows": "1000", "wt": "json", "sort": "idoferta desc"}
                         r = session.get(url_solr, params=params, verify=not INSECURE_SSL, timeout=REQUEST_TIMEOUT)
                         r.encoding = 'latin-1'
 
@@ -795,8 +739,6 @@ def monitorear():
                             hallazgos.sort(key=lambda x: extraer_timestamp(x.get('iniciooferta')))
                             # -------------------------------------------------------------------------
                             
-                            ts = int(time.time() * 1000)
-
                             procesados_en_vuelta = set()
 
                             for info in hallazgos:
@@ -806,43 +748,20 @@ def monitorear():
                                     continue
                                 procesados_en_vuelta.add(id_o)
 
-                                estado_actual = str(info.get('estado', '')).upper()
-                                estado_previo = None
-
-                                if UPSTASH_URL and UPSTASH_TOKEN:
-                                    base_url = UPSTASH_URL.rstrip('/')
-                                    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-                                    try:
-                                        resp = UPSTASH_SESSION.get(f"{base_url}/get/oferta_{id_o}", headers=headers, timeout=5)
-                                        if resp.status_code == 200:
-                                            estado_previo = resp.json().get("result")
-                                    except Exception:
-                                        estado_previo = ofertas_estados_local.get(id_o)
-                                else:
-                                    estado_previo = ofertas_estados_local.get(id_o)
-
                                 es_nueva_y_publicada = False
-                                cambio_a_designada = False
-
-                                if not estado_previo:
-                                    if estado_actual == "PUBLICADA":
-                                        es_nueva_y_publicada = True
-                                else:
-                                    if estado_previo == "PUBLICADA" and estado_actual == "DESIGNADA":
-                                        cambio_a_designada = True
-
-                                if not estado_previo or (estado_previo != estado_actual):
-                                    if UPSTASH_URL and UPSTASH_TOKEN:
-                                        try:
-                                            # Se añade /EX/604800 para que el dato se autodestruya en 7 días exactos
-                                            UPSTASH_SESSION.get(f"{base_url}/set/oferta_{id_o}/{estado_actual}/EX/604800", headers=headers, timeout=5)
-                                        except Exception:
-                                            ofertas_estados_local[id_o] = estado_actual
+                                if UPSTASH_URL and UPSTASH_TOKEN:
+                                    # Detección atómica de novedad sin GET previo
+                                    result = upstash_cmd("set", f"oferta_{id_o}", "PUBLICADA", "EX", 604800, "NX")
+                                    if result is None:
+                                        es_nueva_y_publicada = id_o not in ofertas_vistas_local
+                                        ofertas_vistas_local.add(id_o)
                                     else:
-                                        ofertas_estados_local[id_o] = estado_actual
+                                        es_nueva_y_publicada = str(result).upper() == "OK"
+                                else:
+                                    es_nueva_y_publicada = id_o not in ofertas_vistas_local
+                                    ofertas_vistas_local.add(id_o)
 
                                 escuela = html.escape(str(info.get('escuela', 'N/A')))
-                                cargo = html.escape(str(info.get('cargo', 'N/A')))
                                 curso_division = html.escape(str(info.get('cursodivision', '-')).strip())
                                 direccion_raw = str(info.get('domiciliodesempeno', info.get('domicilio', 'N/A')))
                                 direccion = html.escape(limpiar_direccion(direccion_raw))
@@ -858,9 +777,12 @@ def monitorear():
                                 hasta = html.escape(formatear_fecha_argentina(info.get('supl_hasta'), tz_ar).split()[0])
 
                                 jornada_raw = str(info.get('jornada', '')).upper()
-                                if "JC" in jornada_raw:
-                                    jornada_texto = "🔴 COMPLETA 🔴"
-                                elif "JS" in jornada_raw:
+                                es_jornada_completa = ("JC" in jornada_raw) or ("COMPLETA" in jornada_raw)
+                                es_jornada_simple = ("JS" in jornada_raw) or ("SIMPLE" in jornada_raw)
+
+                                if es_jornada_completa:
+                                    jornada_texto = "🔴 Completa"
+                                elif es_jornada_simple:
                                     jornada_texto = "Simple"
                                 else:
                                     jornada_texto = html.escape(jornada_raw) if jornada_raw else "N/A"
@@ -869,43 +791,31 @@ def monitorear():
                                 inicio_oferta = html.escape(inicio_oferta_txt)
                                 inicio_oferta_ts = extraer_timestamp(info.get('iniciooferta'))
 
-                                if estado_actual == "PUBLICADA":
-                                    ranking, contiene_doc_objetivo = obtener_top_postulantes(session, id_o)
-                                    link = f"https://misservicios.abc.gob.ar/actos.publicos.digitales/postulantes/?oferta={id_o}&detalle={info.get('iddetalle', id_o)}"
-                                    txt = f"🏫 <b>Escuela:</b> <code>{escuela}</code>\n"
-                                    if direccion not in ("N/A", "-", ""):
-                                        txt += f"📍 <b>Dirección:</b> {direccion}\n"
-                                    txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
-                                    txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
-                                    if curso_division not in ("-", "", "N/A"):
-                                        txt += f"👥 <b>Curso/Div:</b> {curso_division}\n"
-                                    txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
-                                    txt += f"📝 <b>Revista:</b> {revista}\n"
-                                    txt += f"🟢 <b>Desde:</b> {desde}\n"
-                                    txt += f"🔴 <b>Hasta:</b> {hasta}\n"
-                                    txt += f"🏆 <b>Puntajes:</b>\n{ranking}"
-                                    txt += f"🔗 <a href=\"{html.escape(link, quote=True)}\">VER ESCUELA</a>\n"
-                                    txt += "───────────────────\n"
+                                ranking, contiene_doc_objetivo = obtener_top_postulantes(session, id_o)
+                                txt = f"🏫 Escuela: {escuela}\n"
+                                if direccion not in ("N/A", "-", ""):
+                                    txt += f"📍 Dirección: {direccion}\n"
+                                txt += "\n"
+                                txt += "🕒 Oferta\n"
+                                txt += f"• Inicio: {inicio_oferta}\n"
+                                txt += f"• Cierre: {cierre_oferta}\n"
+                                txt += "\n"
+                                if curso_division not in ("-", "", "N/A"):
+                                    txt += f"👥 Curso/Div: {curso_division}\n"
+                                txt += f"⏱ Jornada: {jornada_texto}\n"
+                                txt += f"📝 Revista: {revista}\n"
+                                txt += "\n"
+                                txt += "📅 Vigencia\n"
+                                txt += f"• Desde: {desde}\n"
+                                txt += f"• Hasta: {hasta}\n"
+                                txt += "\n"
+                                txt += "🏆 Puntajes\n"
+                                txt += f"{ranking}"
 
-                                    temp_cache_ordenable.append((contiene_doc_objetivo, inicio_oferta_ts, txt))
+                                temp_cache_ordenable.append((contiene_doc_objetivo, inicio_oferta_ts, txt))
 
-                                    if es_nueva_y_publicada:
-                                        buffer_nuevas.append((id_o, txt, contiene_doc_objetivo, inicio_oferta_ts))
-
-                                elif cambio_a_designada:
-                                    txt = f"🏫 <b>Escuela:</b> {escuela}\n"
-                                    if direccion not in ("N/A", "-", ""):
-                                        txt += f"📍 <b>Dirección:</b> {direccion}\n"
-                                    txt += f"🕒 <b>Inicio Oferta:</b> {inicio_oferta}\n"
-                                    txt += f"⏳ <b>Cierre Oferta:</b> {cierre_oferta}\n"
-                                    if curso_division not in ("-", "", "N/A"):
-                                        txt += f"👥 <b>Curso/Div:</b> {curso_division}\n"
-                                    txt += f"⏱ <b>Jornada:</b> {jornada_texto}\n"
-                                    txt += f"📝 <b>Revista:</b> {revista}\n"
-                                    txt += f"🟢 <b>Desde:</b> {desde}\n"
-                                    txt += f"🔴 <b>Hasta:</b> {hasta}\n"
-                                    txt += "───────────────────\n"
-                                    buffer_cerradas.append((id_o, txt))
+                                if es_nueva_y_publicada:
+                                    buffer_nuevas.append((id_o, txt, contiene_doc_objetivo, inicio_oferta_ts, es_jornada_completa))
 
                             temp_cache_ordenable.sort(key=lambda x: (x[0], x[1]))
                             temp_cache = [item[2] for item in temp_cache_ordenable]
@@ -914,66 +824,41 @@ def monitorear():
                                 CACHE_RESULTADOS = temp_cache
                             ULTIMA_CARGA_OK_TS = time.time()
 
-                            if fue_refresh_forzado:
-                                limpiar_chat()
-                                if temp_cache:
-                                    enviar_ofertas_sin_cortes(
-                                        temp_cache,
-                                        encabezado=f"📊 <b>LISTADO DE CARGOS ({len(temp_cache)} resultados):</b>",
-                                        silencioso=True,
-                                        es_permanente=False,
-                                        repetir_encabezado=False,
-                                        pausa_segundos=1,
-                                        con_boton_al_final=True
-                                    )
-                                else:
-                                    enviar_telegram("📭 No hay cargos activos en este momento.", silencioso=True, es_permanente=False, con_boton=True)
+                            if POST_FETCH_GRACE_SECONDS > 60:
+                                time.sleep(POST_FETCH_GRACE_SECONDS)
+
+                            limpiar_chat()
+                            if temp_cache:
+                                enviar_ofertas_sin_cortes(
+                                    temp_cache,
+                                    encabezado=f"📊 Listado de cargos ({len(temp_cache)} resultados)",
+                                    silencioso=True,
+                                    es_permanente=False,
+                                    repetir_encabezado=False,
+                                    pausa_segundos=1,
+                                    con_boton_al_final=True
+                                )
+                            else:
+                                enviar_telegram("📭 Sin cargos activos en este momento.", silencioso=True, es_permanente=False, con_boton=True)
 
                             ahora = datetime.now(tz_ar)
-                            hora_actual = ahora.hour
                             hora_str = ahora.strftime("%H:%M")
 
                             if buffer_nuevas:
                                 buffer_nuevas.sort(key=lambda x: (x[2], x[3]))
-                                for id_o, txt, _, _ in buffer_nuevas:
-                                    # Verificamos si el mensaje contiene la etiqueta de Jornada Completa
-                                    es_jc = "🔴 COMPLETA 🔴" in txt
+                                for id_o, txt, _, _, es_jc in buffer_nuevas:
                                     
-                                    mensaje_nuevo = f"🚨 <b>NUEVO CARGO ({hora_str} hs)</b> 🚨\n\n{txt}"
+                                    mensaje_nuevo = f"🚨 Nuevo cargo ({hora_str} hs)\n\n{txt}"
                                     
                                     # Solo emitirá sonido (silencioso=False) si es Jornada Completa.
                                     # De lo contrario, se envía silenciado.
-                                    sent_ids = enviar_telegram(
+                                    enviar_telegram(
                                         mensaje_nuevo, 
                                         silencioso=(not es_jc), 
                                         es_permanente=False
                                     )
-                                    
-                                    if sent_ids:
-                                        guardar_mensaje_oferta(id_o, sent_ids[0])
                                     time.sleep(2)
 
-                            if buffer_cerradas:
-                                for id_o, txt in buffer_cerradas:
-                                    mensaje_designada = f"❌ <b>CARGO DESIGNADO ({hora_str} hs)</b> ❌\n\n{txt}"
-                                    message_id = obtener_mensaje_oferta(id_o)
-                                    editado = False
-                                    if message_id is not None:
-                                        editado = editar_mensaje_telegram(message_id, mensaje_designada)
-
-                                    if not editado:
-                                        enviar_telegram(mensaje_designada, silencioso=True, es_permanente=False)
-
-                                    eliminar_mensaje_oferta(id_o)
-                                    time.sleep(2)
-
-                            slot_reporte = f"{ahora.strftime('%Y-%m-%d')} {hora_actual:02d}:{(ahora.minute // 30) * 30:02d}"
-
-                            if (buffer_nuevas or buffer_cerradas):
-                                ultimo_reporte_enviado = slot_reporte
-                            elif not buffer_nuevas and not buffer_cerradas and ahora.minute in (0, 30) and ultimo_reporte_enviado != slot_reporte:
-                                enviar_telegram(f"⏳ <i>{hora_str} hs - Bot activo: Monitoreando sin novedades por el momento.</i>", silencioso=True, es_permanente=False)
-                                ultimo_reporte_enviado = slot_reporte
                         else:
                             print(f"[!] Consulta devuelta con estado {r.status_code}", flush=True)
 
@@ -983,19 +868,8 @@ def monitorear():
 
                 # --- EL NUEVO SUEÑO LIGERO OPTIMIZADO ---
                 lock_perdido = False
-                HORAS_AUTO = {8, 12, 17}
 
                 for i in range(60):
-                    ahora_check = datetime.now(tz_ar)
-                    
-                    # Verificación de horarios programados
-                    if ahora_check.hour in HORAS_AUTO and ahora_check.minute == 0:
-                        if not ejecutado_en_minuto:
-                            FORZAR_REFRESH.set()
-                            ejecutado_en_minuto = True
-                    else:
-                        ejecutado_en_minuto = False
-
                     desperto_por_boton = FORZAR_REFRESH.wait(timeout=15.0) 
                     
                     if desperto_por_boton:
