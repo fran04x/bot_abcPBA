@@ -99,6 +99,8 @@ try:
 except ValueError:
     POST_FETCH_GRACE_SECONDS = 0
 
+SOLO_JORNADA_COMPLETA = os.environ.get("SOLO_JORNADA_COMPLETA", "false").strip().lower() == "true"
+
 DOC_PARTICIPANTE_PRIORITARIO = "30426801"
 
 if INSECURE_SSL:
@@ -915,6 +917,9 @@ def monitorear():
                                 jornada_raw = str(info.get('jornada', '')).upper()
                                 es_jornada_completa = ("JC" in jornada_raw) or ("COMPLETA" in jornada_raw)
                                 es_jornada_simple = ("JS" in jornada_raw) or ("SIMPLE" in jornada_raw)
+
+                                if SOLO_JORNADA_COMPLETA and not es_jornada_completa:
+                                    continue
 
                                 if es_jornada_completa:
                                     jornada_texto = "🔴 Completa"
